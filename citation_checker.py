@@ -1874,11 +1874,13 @@ _ID_RE = re.compile(r'\bId\.\s*(?:at\s+\d+)?', re.IGNORECASE)
 
 
 def extract_quotes(text: str, citations: list) -> list:
-    """Extract substantial quoted passages and attribute them to citations.
+    """Extract substantial quoted passages attributed to case citations.
 
-    Finds quoted text ≥ 40 characters and links each to the nearest citation
-    (looking within ~300 chars after the quote, falling back to nearest before).
-    Handles Id./Ibid. references by tracking the last-cited case.
+    Finds quoted text ≥ 40 characters and links each to a citation that
+    appears within ~300 chars after the quote (or an Id./Ibid. reference).
+    Quotes that are NOT directly followed by a case citation are excluded —
+    they are likely from transcripts, statutes, or other non-case-law
+    sources that would not appear in case law databases.
     """
     if not citations:
         return []
@@ -1922,16 +1924,13 @@ def extract_quotes(text: str, citations: list) -> list:
                     last_cite_index = idx
                     break
 
-        # Fall back to nearest citation before the quote
+        # Only verify quotes that are directly followed by a case citation
+        # (or Id./Ibid.).  Quotes with no citation after them are likely
+        # from transcripts, statutes, or other non-case-law sources —
+        # searching for them in case law databases would produce false
+        # negatives.
         if attributed_index is None:
-            for pos, idx in reversed(cite_positions):
-                if pos <= quote_start:
-                    attributed_index = idx
-                    last_cite_index = idx
-                    break
-
-        if attributed_index is None:
-            continue  # Can't attribute this quote
+            continue  # No citation after the quote — skip it
 
         cite = citations[attributed_index]
         cite_label = f"{cite.volume} {cite.reporter} {cite.page}"
