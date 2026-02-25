@@ -36,6 +36,7 @@ from citation_checker import (
     extract_citations,
     verify_citation,
     REQUEST_DELAY,
+    compute_ai_score,
 )
 import requests as http_requests
 
@@ -306,6 +307,111 @@ HTML_PAGE = """<!DOCTYPE html>
     color: #2d3436;
   }
 
+  /* AI Score Section */
+  .ai-score-section {
+    display: none;
+    margin-top: 1.5rem;
+    background: #fff;
+    border-radius: 12px;
+    padding: 2rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  .ai-score-section h3 {
+    text-align: center;
+    font-size: 1.2rem;
+    margin-bottom: 1rem;
+  }
+
+  .score-display {
+    text-align: center;
+    margin: 1.5rem 0;
+  }
+
+  .score-number {
+    font-size: 4rem;
+    font-weight: 800;
+    line-height: 1;
+  }
+
+  .score-max {
+    font-size: 1.1rem;
+    color: #636e72;
+    font-weight: 600;
+    margin-top: 0.25rem;
+  }
+
+  .score-label {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-top: 0.5rem;
+  }
+
+  .score-green { color: #27ae60; }
+  .score-yellow { color: #f39c12; }
+  .score-orange { color: #e67e22; }
+  .score-red { color: #c0392b; }
+
+  .flagged-banner {
+    display: none;
+    margin: 1rem 0;
+    padding: 1rem;
+    background: #c0392b;
+    color: #fff;
+    border-radius: 8px;
+    font-weight: 700;
+    font-size: 1rem;
+    text-align: center;
+  }
+
+  .criteria-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 1.5rem;
+  }
+
+  .criteria-table th,
+  .criteria-table td {
+    text-align: left;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.85rem;
+    border-bottom: 1px solid #eee;
+  }
+
+  .criteria-table th {
+    background: #f8f9fa;
+    color: #2d3436;
+    font-weight: 600;
+    font-size: 0.85rem;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .criteria-table .pts-cell {
+    text-align: center;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .criteria-table .detail-cell {
+    font-size: 0.8rem;
+    color: #636e72;
+  }
+
+  .pts-zero { color: #27ae60; }
+  .pts-some { color: #e67e22; }
+  .pts-max { color: #c0392b; }
+
+  .methodology-box {
+    margin-top: 1rem;
+    padding: 1rem;
+    background: #f8f9fa;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    color: #636e72;
+    line-height: 1.5;
+  }
+
   @media (max-width: 600px) {
     .container { padding: 1rem; }
     th, td { padding: 0.5rem; font-size: 0.8rem; }
@@ -383,6 +489,37 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="warning-banner" id="warningBanner"></div>
   </div>
+
+  <!-- AI Detection Score -->
+  <div class="ai-score-section" id="aiScoreSection">
+    <h3>AI Detection Analysis</h3>
+    <div class="score-display">
+      <div class="score-number" id="scoreNumber">--</div>
+      <div class="score-max">out of 100 points</div>
+      <div class="score-label" id="scoreLabel"></div>
+    </div>
+    <div class="flagged-banner" id="flaggedBanner">
+      &#9888; FLAGGED: Fabricated case citations detected &mdash; this brief is presumed AI-generated
+    </div>
+    <table class="criteria-table">
+      <thead>
+        <tr>
+          <th>Criterion</th>
+          <th>Points</th>
+          <th>Finding</th>
+        </tr>
+      </thead>
+      <tbody id="criteriaBody"></tbody>
+    </table>
+    <div class="methodology-box">
+      <strong>How this score is calculated:</strong> The score is the sum of points across 11 criteria
+      that indicate potential AI generation. Each criterion has a maximum point value based on its
+      significance as an AI indicator. Higher total scores indicate greater likelihood that the brief
+      was AI-generated. The presence of fabricated (non-existent) case citations automatically flags
+      the brief as AI-generated regardless of the total score. A score of 0 means no AI indicators
+      were detected.
+    </div>
+  </div>
 </div>
 
 <script>
@@ -459,6 +596,8 @@ function resetUI() {
   warningBanner.style.display = 'none';
   progressBar.style.width = '0%';
   csvBtn.disabled = true;
+  document.getElementById('aiScoreSection').style.display = 'none';
+  document.getElementById('flaggedBanner').style.display = 'none';
 }
 
 async function startCheck() {
@@ -577,6 +716,11 @@ function startVerification(jobId, total) {
       csvBtn.onclick = () => {
         window.location.href = '/download/' + jobId;
       };
+
+      // Display AI detection score
+      if (data.ai_score) {
+        displayAiScore(data.ai_score);
+      }
     }
   };
 
@@ -597,6 +741,49 @@ function formatStatus(s) {
     pending: 'Pending',
   };
   return labels[s] || s;
+}
+
+function displayAiScore(aiScore) {
+  const section = document.getElementById('aiScoreSection');
+  const scoreNum = document.getElementById('scoreNumber');
+  const scoreLabel = document.getElementById('scoreLabel');
+  const flagged = document.getElementById('flaggedBanner');
+  const body = document.getElementById('criteriaBody');
+
+  section.style.display = 'block';
+
+  const score = aiScore.total_score;
+  scoreNum.textContent = score;
+
+  let colorClass;
+  if (score === 0) colorClass = 'score-green';
+  else if (score <= 10) colorClass = 'score-green';
+  else if (score <= 30) colorClass = 'score-yellow';
+  else if (score <= 50) colorClass = 'score-orange';
+  else colorClass = 'score-red';
+
+  scoreNum.className = 'score-number ' + colorClass;
+  scoreLabel.textContent = aiScore.label;
+  scoreLabel.className = 'score-label ' + colorClass;
+
+  if (aiScore.auto_flagged) {
+    flagged.style.display = 'block';
+  }
+
+  body.innerHTML = '';
+  aiScore.criteria.forEach(function(c) {
+    const tr = document.createElement('tr');
+    let ptsClass = c.points === 0 ? 'pts-zero' : (c.points >= c.max ? 'pts-max' : 'pts-some');
+    tr.innerHTML =
+      '<td><strong>' + escHtml(c.name) + '</strong><br>' +
+      '<span style="font-size:0.8rem;color:#636e72">' + escHtml(c.description) + '</span></td>' +
+      '<td class="pts-cell"><span class="' + ptsClass + '">' + c.points + '</span> / ' + c.max + '</td>' +
+      '<td class="detail-cell">' + escHtml(c.detail) + '</td>';
+    body.appendChild(tr);
+  });
+
+  // Scroll to score section
+  section.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function escHtml(str) {
@@ -652,6 +839,7 @@ def upload():
     jobs[job_id] = {
         "citations": citations,
         "results": [],
+        "text": text,
     }
 
     # Return the extracted citations (without verification yet)
@@ -710,7 +898,10 @@ def verify(job_id):
             if i < len(citations) - 1:
                 time.sleep(REQUEST_DELAY)
 
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        # Compute AI detection score after all citations verified
+        ai_result = compute_ai_score(job.get("text", ""), list(job["results"]))
+        done_payload = {"type": "done", "ai_score": ai_result}
+        yield f"data: {json.dumps(done_payload)}\n\n"
 
     return Response(
         generate(),

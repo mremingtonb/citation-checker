@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from statistics import mean, stdev
 
 import docx
 import requests
@@ -582,6 +583,837 @@ def write_csv(citations: list[Citation], filepath: str) -> None:
                 cite.detail,
             ])
     print(f"  Results saved to: {filepath}\n")
+
+
+# ---------------------------------------------------------------------------
+# AI-generation probability scoring (100-point scale)
+# ---------------------------------------------------------------------------
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences, respecting legal abbreviations."""
+    _DOT = "<<DOT>>"  # safe placeholder that won't appear in legal text
+    temp = text
+    # Protect abbreviation periods with placeholder
+    for abbrev in _LEGAL_ABBREVS:
+        pat = re.compile(r'\b' + re.escape(abbrev) + r'\.', re.IGNORECASE)
+        temp = pat.sub(lambda m: m.group(0)[:-1] + _DOT, temp)
+    # Protect other common patterns
+    temp = re.sub(r'([A-Z])\.([A-Z])', lambda m: m.group(1) + _DOT + m.group(2), temp)
+    temp = re.sub(r'\b(Dr|Mr|Mrs|Ms|Jr|Sr|Prof|Hon|Rev)\.', lambda m: m.group(1) + _DOT, temp)
+    temp = re.sub(r'\b(No|Nos|Vol|App|Supp|Cir|Dist|Ct)\.', lambda m: m.group(1) + _DOT, temp)
+    temp = re.sub(r'\b(v|vs)\.', lambda m: m.group(1) + _DOT, temp)
+    temp = re.sub(r'\b(e\.g|i\.e|cf|et al)\.', lambda m: m.group(0)[:-1] + _DOT, temp)
+    temp = re.sub(r'\b(Id|id)\.', lambda m: m.group(1) + _DOT, temp)
+    temp = re.sub(r'(\d)(st|nd|rd|th)\.', lambda m: m.group(0)[:-1] + _DOT, temp)
+
+    sentences = re.split(r'(?<=[.!?])\s+', temp)
+    sentences = [s.replace(_DOT, '.') for s in sentences]
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 15]
+    return sentences
+
+
+# --- Criterion 3: Improper citation formatting (max 5 pts) ---
+
+_MALFORMED_CITE_PATTERNS = [
+    re.compile(r'\d{1,4}\s+F\d[a-z]*\s+\d{1,5}'),             # "123 F3d 456"
+    re.compile(r'\d{1,4}\s+S\s?Ct\b\s+\d{1,5}'),              # "583 SCt 2459"
+    re.compile(r'\d{1,4}\s+L\s?Ed\b\s+\d{1,5}'),              # "576 LEd 123"
+    re.compile(r'\d{1,4}\s+US\s+\d{1,5}'),                     # "547 US 410"
+    re.compile(r'\d{1,4}\s+FSupp\s+\d{1,5}'),                  # "123 FSupp 456"
+]
+
+
+def _detect_formatting_issues(text: str) -> dict:
+    """Criterion 3: Detect improperly formatted citations (max 5 pts)."""
+    count = 0
+    details = []
+    for pat in _MALFORMED_CITE_PATTERNS:
+        matches = pat.findall(text)
+        count += len(matches)
+        for m in matches[:2]:
+            details.append(m.strip())
+
+    if count == 0:
+        pts = 0
+    elif count <= 2:
+        pts = 2
+    elif count <= 4:
+        pts = 3
+    else:
+        pts = 5
+
+    return {
+        "points": pts,
+        "max": 5,
+        "detail": f"Found {count} malformed citation(s)" if count else "No formatting issues detected",
+    }
+
+
+# --- Criterion 4: Pro se litigant + complex legalese (max 20 pts) ---
+
+_PRO_SE_PATTERNS = [
+    re.compile(r'\bpro\s+se\b', re.IGNORECASE),
+    re.compile(r'\bself[- ]represented\b', re.IGNORECASE),
+    re.compile(r'\bwithout\s+(?:an?\s+)?attorney\b', re.IGNORECASE),
+    re.compile(r'\bunrepresented\b', re.IGNORECASE),
+]
+
+_LATIN_LEGAL_PHRASES = [
+    "inter alia", "sua sponte", "res judicata", "stare decisis",
+    "prima facie", "arguendo", "sub judice", "amicus curiae",
+    "de novo", "ab initio", "in limine", "nunc pro tunc",
+    "pro hac vice", "quo warranto", "certiorari", "mandamus",
+    "habeas corpus", "res ipsa loquitur", "voir dire", "in camera",
+    "ipso facto", "per curiam", "sine qua non", "in personam",
+    "in rem", "pendente lite", "ejusdem generis", "noscitur a sociis",
+    "expressio unius",
+]
+
+_COMPLEX_LEGAL_TERMS = [
+    "notwithstanding", "aforementioned", "hereinafter", "heretofore",
+    "inasmuch as", "insofar as", "therein", "thereof", "whereby",
+    "wherein", "wherefore", "theretofore", "hereinabove",
+    "hereinbelow", "aforestated", "abovementioned",
+]
+
+
+def _detect_pro_se_legalese(text: str) -> dict:
+    """Criterion 4: Pro se litigant using complex legalese (max 20 pts)."""
+    is_pro_se = any(p.search(text) for p in _PRO_SE_PATTERNS)
+
+    if not is_pro_se:
+        return {
+            "points": 0,
+            "max": 20,
+            "detail": "Pro se status not detected \u2014 criterion skipped",
+            "pro_se_detected": False,
+        }
+
+    text_lower = text.lower()
+    word_count = len(text.split())
+    if word_count < 100:
+        return {
+            "points": 0,
+            "max": 20,
+            "detail": "Pro se detected but document too short to analyze",
+            "pro_se_detected": True,
+        }
+
+    latin_count = sum(1 for phrase in _LATIN_LEGAL_PHRASES if phrase in text_lower)
+    complex_count = sum(
+        len(re.findall(r'\b' + re.escape(term) + r'\b', text_lower))
+        for term in _COMPLEX_LEGAL_TERMS
+    )
+
+    legalese_per_1k = ((latin_count + complex_count) / word_count) * 1000
+
+    if legalese_per_1k < 1:
+        pts = 0
+    elif legalese_per_1k < 2:
+        pts = 5
+    elif legalese_per_1k < 3.5:
+        pts = 10
+    elif legalese_per_1k < 5:
+        pts = 15
+    else:
+        pts = 20
+
+    return {
+        "points": pts,
+        "max": 20,
+        "detail": (
+            f"Pro se brief with {latin_count} Latin phrase(s) and "
+            f"{complex_count} complex legal term(s) "
+            f"({legalese_per_1k:.1f} per 1,000 words)"
+        ),
+        "pro_se_detected": True,
+    }
+
+
+# --- Criterion 5: Unusual syntax (max 10 pts) ---
+
+def _detect_unusual_syntax(text: str) -> dict:
+    """Criterion 5: Detect unusual syntax patterns (max 10 pts)."""
+    sentences = _split_sentences(text)
+    if len(sentences) < 5:
+        return {"points": 0, "max": 10, "detail": "Not enough text to analyze syntax"}
+
+    findings = []
+    pts = 0
+
+    # 5a: Sentence length uniformity
+    lengths = [len(s.split()) for s in sentences]
+    avg_len = mean(lengths)
+    if avg_len > 0 and len(lengths) >= 5:
+        sd = stdev(lengths)
+        cv = sd / avg_len
+        if cv < 0.25:
+            pts += 4
+            findings.append(f"Very uniform sentence lengths (CV={cv:.2f})")
+        elif cv < 0.35:
+            pts += 2
+            findings.append(f"Somewhat uniform sentence lengths (CV={cv:.2f})")
+
+    # 5b: Passive voice density
+    passive_patterns = [
+        re.compile(r'\b(?:is|are|was|were|been|being)\s+\w+ed\b'),
+        re.compile(r'\b(?:is|are|was|were|been|being)\s+\w+en\b'),
+    ]
+    passive_count = sum(len(p.findall(text)) for p in passive_patterns)
+    passive_ratio = passive_count / len(sentences) if sentences else 0
+    if passive_ratio > 0.6:
+        pts += 4
+        findings.append(f"High passive voice density ({passive_ratio:.0%} of sentences)")
+    elif passive_ratio > 0.4:
+        pts += 2
+        findings.append(f"Elevated passive voice ({passive_ratio:.0%} of sentences)")
+
+    # 5c: Overly long average sentence length
+    if avg_len > 35:
+        pts += 2
+        findings.append(f"Very long average sentences ({avg_len:.0f} words)")
+
+    return {
+        "points": min(pts, 10),
+        "max": 10,
+        "detail": "; ".join(findings) if findings else "No unusual syntax patterns detected",
+    }
+
+
+# --- Criterion 6: Out-of-jurisdiction citations (max 10 pts) ---
+
+_CIRCUIT_STATES = {
+    "1": {"me", "ma", "nh", "ri", "pr"},
+    "2": {"ct", "ny", "vt"},
+    "3": {"de", "nj", "pa", "vi"},
+    "4": {"md", "nc", "sc", "va", "wv"},
+    "5": {"la", "ms", "tx"},
+    "6": {"ky", "mi", "oh", "tn"},
+    "7": {"il", "in", "wi"},
+    "8": {"ar", "ia", "mn", "mo", "ne", "nd", "sd"},
+    "9": {"ak", "az", "ca", "hi", "id", "mt", "nv", "or", "wa", "gu"},
+    "10": {"co", "ks", "nm", "ok", "ut", "wy"},
+    "11": {"al", "fl", "ga"},
+    "dc": {"dc"},
+}
+
+_STATE_ABBREV = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
+    "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
+    "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
+    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm", "new york": "ny",
+    "north carolina": "nc", "north dakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhode island": "ri", "south carolina": "sc",
+    "south dakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut",
+    "vermont": "vt", "virginia": "va", "washington": "wa", "west virginia": "wv",
+    "wisconsin": "wi", "wyoming": "wy", "district of columbia": "dc",
+}
+
+_COURT_STATE_MAP = {
+    "cal": "ca", "tex": "tx", "fla": "fl", "ill": "il", "ohio": "oh",
+    "mich": "mi", "n.y": "ny", "n.j": "nj", "pa": "pa", "mass": "ma",
+    "conn": "ct", "md": "md", "va": "va", "ga": "ga", "la": "la",
+    "wash": "wa", "colo": "co", "ariz": "az", "ala": "al",
+    "ind": "in", "minn": "mn", "mo": "mo", "wis": "wi", "iowa": "ia",
+    "kan": "ks", "ky": "ky", "tenn": "tn", "miss": "ms", "ark": "ar",
+    "neb": "ne", "nev": "nv", "n.m": "nm", "idaho": "id", "utah": "ut",
+    "mont": "mt", "wyo": "wy", "s.d": "sd", "n.d": "nd", "me": "me",
+    "n.h": "nh", "vt": "vt", "r.i": "ri", "del": "de", "haw": "hi",
+    "alaska": "ak", "w.va": "wv", "s.c": "sc", "n.c": "nc", "okla": "ok",
+}
+
+
+def _detect_jurisdiction(text: str) -> dict:
+    """Auto-detect the court jurisdiction from document headers."""
+    header = text[:2000].upper()
+    result = {"type": None, "circuit": None, "state": None, "court_name": None}
+
+    # Federal circuit court
+    circuit_match = re.search(
+        r'(?:COURT\s+OF\s+APPEALS|CIRCUIT\s+COURT\s+OF\s+APPEALS)\s+'
+        r'(?:FOR\s+THE\s+)?(\w+)\s+CIRCUIT',
+        header,
+    )
+    if circuit_match:
+        circuit_text = circuit_match.group(1).lower()
+        circuit_map = {
+            "first": "1", "second": "2", "third": "3", "fourth": "4",
+            "fifth": "5", "sixth": "6", "seventh": "7", "eighth": "8",
+            "ninth": "9", "tenth": "10", "eleventh": "11",
+            "1st": "1", "2nd": "2", "2d": "2", "3rd": "3", "3d": "3",
+            "4th": "4", "5th": "5", "6th": "6", "7th": "7", "8th": "8",
+            "9th": "9", "10th": "10", "11th": "11",
+        }
+        circuit_num = circuit_map.get(circuit_text)
+        if circuit_num:
+            result["type"] = "federal_circuit"
+            result["circuit"] = circuit_num
+            result["court_name"] = f"{circuit_match.group(1).title()} Circuit"
+            return result
+
+    # Federal district court
+    district_match = re.search(
+        r'(?:UNITED\s+STATES\s+)?DISTRICT\s+COURT\s+'
+        r'(?:FOR\s+THE\s+)?'
+        r'(?:(?:NORTHERN|SOUTHERN|EASTERN|WESTERN|MIDDLE|CENTRAL)\s+)?'
+        r'DISTRICT\s+OF\s+'
+        r'([A-Z][A-Z\s]+)',
+        header,
+    )
+    if district_match:
+        state_name = district_match.group(1).strip().lower()
+        state_abbrev = _STATE_ABBREV.get(state_name)
+        if state_abbrev:
+            for circ, states in _CIRCUIT_STATES.items():
+                if state_abbrev in states:
+                    result["type"] = "federal_district"
+                    result["circuit"] = circ
+                    result["state"] = state_abbrev
+                    result["court_name"] = f"District of {state_name.title()}"
+                    return result
+
+    # State supreme court
+    state_supreme = re.search(
+        r'SUPREME\s+COURT\s+'
+        r'(?:OF\s+(?:THE\s+)?(?:STATE\s+OF\s+)?)?'
+        r'([A-Z][A-Z\s]+)',
+        header,
+    )
+    if state_supreme:
+        state_name = state_supreme.group(1).strip().lower()
+        state_abbrev = _STATE_ABBREV.get(state_name)
+        if state_abbrev:
+            result["type"] = "state"
+            result["state"] = state_abbrev
+            result["court_name"] = f"Supreme Court of {state_name.title()}"
+            return result
+
+    # State appeals court
+    state_appeals = re.search(
+        r'(?:COURT\s+OF\s+APPEAL[S]?|APPELLATE\s+COURT)\s+'
+        r'(?:OF\s+(?:THE\s+)?(?:STATE\s+OF\s+)?)?'
+        r'([A-Z][A-Z\s]+)',
+        header,
+    )
+    if state_appeals:
+        state_name = state_appeals.group(1).strip().lower()
+        state_abbrev = _STATE_ABBREV.get(state_name)
+        if state_abbrev:
+            result["type"] = "state"
+            result["state"] = state_abbrev
+            result["court_name"] = f"Court of Appeals of {state_name.title()}"
+            return result
+
+    # U.S. Supreme Court
+    if re.search(r'SUPREME\s+COURT\s+OF\s+THE\s+UNITED\s+STATES', header):
+        result["type"] = "scotus"
+        result["court_name"] = "Supreme Court of the United States"
+        return result
+
+    return result
+
+
+def _citation_is_in_jurisdiction(cite_court: str, jurisdiction: dict) -> bool:
+    """Check if a citation's court is within the detected jurisdiction."""
+    if not cite_court or not jurisdiction.get("type"):
+        return True
+
+    court_lower = cite_court.lower().strip()
+
+    # SCOTUS citations are always in-jurisdiction
+    if not court_lower:
+        return True
+
+    jur_type = jurisdiction["type"]
+    if jur_type == "scotus":
+        return True
+
+    # Check for circuit match
+    circuit_match = re.search(r'(\d+)(?:st|nd|rd|th)?\s*cir', court_lower)
+    if circuit_match:
+        cite_circuit = circuit_match.group(1)
+        if jur_type in ("federal_circuit", "federal_district"):
+            return cite_circuit == jurisdiction.get("circuit")
+        if jur_type == "state":
+            circuit_states = _CIRCUIT_STATES.get(cite_circuit, set())
+            return jurisdiction.get("state") in circuit_states
+
+    # D.C. Circuit
+    if "d.c" in court_lower and "cir" in court_lower:
+        if jur_type in ("federal_circuit", "federal_district"):
+            return jurisdiction.get("circuit") == "dc"
+        return False
+
+    # Check for state court match
+    for abbrev, state_code in _COURT_STATE_MAP.items():
+        if abbrev in court_lower:
+            if jur_type == "state":
+                return state_code == jurisdiction.get("state")
+            elif jur_type in ("federal_circuit", "federal_district"):
+                circuit_states = _CIRCUIT_STATES.get(
+                    jurisdiction.get("circuit", ""), set()
+                )
+                return state_code in circuit_states
+
+    return True  # Can't determine, assume OK
+
+
+def _detect_out_of_jurisdiction(text: str, citations: list) -> dict:
+    """Criterion 6: Detect out-of-jurisdiction citations (max 10 pts)."""
+    jurisdiction = _detect_jurisdiction(text)
+
+    if not jurisdiction.get("type"):
+        return {
+            "points": 0,
+            "max": 10,
+            "detail": "Could not detect brief's jurisdiction \u2014 criterion skipped",
+            "jurisdiction": None,
+        }
+
+    if not citations:
+        return {
+            "points": 0,
+            "max": 10,
+            "detail": (
+                f"Jurisdiction detected: {jurisdiction.get('court_name', 'Unknown')}; "
+                "no citations to check"
+            ),
+            "jurisdiction": jurisdiction,
+        }
+
+    out_count = 0
+    out_examples = []
+    for cite in citations:
+        if not _citation_is_in_jurisdiction(cite.court, jurisdiction):
+            out_count += 1
+            if len(out_examples) < 3:
+                out_examples.append(f"{cite.parties} ({cite.court})")
+
+    total = len(citations)
+    ratio = out_count / total if total > 0 else 0
+
+    if ratio < 0.2:
+        pts = 0
+    elif ratio < 0.4:
+        pts = 3
+    elif ratio < 0.6:
+        pts = 5
+    elif ratio < 0.8:
+        pts = 7
+    else:
+        pts = 10
+
+    detail = (
+        f"Jurisdiction: {jurisdiction.get('court_name', 'Unknown')}; "
+        f"{out_count}/{total} citations from other jurisdictions"
+    )
+
+    return {
+        "points": pts,
+        "max": 10,
+        "detail": detail,
+        "jurisdiction": jurisdiction,
+    }
+
+
+# --- Criterion 7: Sparse record citations (max 5 pts) ---
+
+_RECORD_PATTERNS = [
+    re.compile(r'\bR\.\s*(?:at\s+)?\d+'),
+    re.compile(r'\(R\.\s*\d+\)'),
+    re.compile(r'\bRecord\s+(?:at\s+)?\d+', re.IGNORECASE),
+    re.compile(r'\bApp\.\s*(?:at\s+)?\d+'),
+    re.compile(r'\bDkt\.\s*(?:No\.\s*)?\d+', re.IGNORECASE),
+    re.compile(r'\bECF\s+(?:No\.\s*)?\d+', re.IGNORECASE),
+    re.compile(r'\bDoc\.\s*(?:No\.\s*)?\d+', re.IGNORECASE),
+    re.compile(r'\bTr\.\s*(?:at\s+)?\d+'),
+    re.compile(r'\bJ\.?A\.\s*\d+'),
+]
+
+
+def _detect_sparse_record_citations(text: str) -> dict:
+    """Criterion 7: Detect sparse record/trial citations (max 5 pts)."""
+    word_count = len(text.split())
+    if word_count < 500:
+        return {
+            "points": 0,
+            "max": 5,
+            "detail": "Document too short to evaluate record citations",
+        }
+
+    record_count = sum(len(p.findall(text)) for p in _RECORD_PATTERNS)
+    expected = word_count / 300
+
+    if record_count == 0 and word_count > 1000:
+        pts = 5
+        detail = "No record or docket citations found in a substantive brief"
+    elif record_count < expected * 0.2:
+        pts = 3
+        detail = f"Very few record citations ({record_count} found, expected ~{int(expected)})"
+    elif record_count < expected * 0.5:
+        pts = 1
+        detail = f"Somewhat sparse record citations ({record_count} found)"
+    else:
+        pts = 0
+        detail = f"Adequate record citations ({record_count} found)"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+# --- Criterion 8: Repeating the same point (max 5 pts) ---
+
+def _detect_repetition(text: str) -> dict:
+    """Criterion 8: Detect repetitive arguments (max 5 pts)."""
+    paragraphs = [p.strip() for p in text.split('\n') if len(p.strip()) > 80]
+    if len(paragraphs) < 3:
+        return {"points": 0, "max": 5, "detail": "Not enough paragraphs to analyze"}
+
+    _stopwords = {
+        "the", "and", "for", "that", "this", "with", "was", "are", "were",
+        "has", "have", "had", "not", "but", "from", "they", "been", "will",
+        "would", "could", "should", "may", "can", "its", "his", "her",
+        "their", "our", "your", "any", "all", "each", "which", "when",
+        "where", "how", "what", "who", "whom", "also", "than", "then",
+        "more", "most", "such", "into", "over", "some", "other",
+    }
+
+    def word_set(para):
+        words = set(re.findall(r'[a-z]{3,}', para.lower()))
+        return words - _stopwords
+
+    para_words = [word_set(p) for p in paragraphs]
+
+    high_sim_pairs = 0
+    for i in range(len(para_words)):
+        for j in range(i + 1, len(para_words)):
+            if not para_words[i] or not para_words[j]:
+                continue
+            intersection = para_words[i] & para_words[j]
+            union = para_words[i] | para_words[j]
+            jaccard = len(intersection) / len(union) if union else 0
+            if jaccard > 0.5:
+                high_sim_pairs += 1
+
+    if high_sim_pairs == 0:
+        pts = 0
+        detail = "No repetitive sections detected"
+    elif high_sim_pairs <= 2:
+        pts = 2
+        detail = f"Some repetition detected ({high_sim_pairs} similar paragraph pair(s))"
+    else:
+        pts = 5
+        detail = f"Significant repetition ({high_sim_pairs} similar paragraph pairs)"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+# --- Criterion 9: Missing procedural posture (max 5 pts) ---
+
+_PROCEDURAL_PATTERNS = [
+    re.compile(r'\bmotion\s+(?:for|to)\s+\w+', re.IGNORECASE),
+    re.compile(r'\bappeal\s+from\b', re.IGNORECASE),
+    re.compile(r'\bthis\s+(?:case|action|matter)\s+arises\b', re.IGNORECASE),
+    re.compile(
+        r'\b(?:plaintiff|defendant|appellant|appellee|petitioner|respondent)'
+        r'\s+(?:filed|moved|seeks|appeals)',
+        re.IGNORECASE,
+    ),
+    re.compile(r'\bcourt\s+(?:granted|denied|dismissed|sustained|overruled)', re.IGNORECASE),
+    re.compile(r'\bprocedural\s+(?:history|background|posture)\b', re.IGNORECASE),
+    re.compile(r'\bstatement\s+of\s+(?:the\s+)?case\b', re.IGNORECASE),
+    re.compile(r'\bfactual\s+(?:background|history)\b', re.IGNORECASE),
+    re.compile(r'\bstandard\s+of\s+review\b', re.IGNORECASE),
+    re.compile(r'\b(?:jury|bench)\s+trial\b', re.IGNORECASE),
+    re.compile(r'\bsummary\s+judgment\b', re.IGNORECASE),
+    re.compile(r'\b(?:remand|reverse|affirm|vacate)\b', re.IGNORECASE),
+]
+
+
+def _detect_missing_procedural_posture(text: str) -> dict:
+    """Criterion 9: Detect missing procedural posture (max 5 pts)."""
+    word_count = len(text.split())
+    if word_count < 500:
+        return {"points": 0, "max": 5, "detail": "Document too short to evaluate"}
+
+    matches = sum(1 for p in _PROCEDURAL_PATTERNS if p.search(text))
+
+    if matches >= 4:
+        pts = 0
+        detail = "Good procedural posture (multiple procedural references found)"
+    elif matches >= 2:
+        pts = 2
+        detail = f"Minimal procedural context ({matches} procedural references)"
+    elif matches >= 1:
+        pts = 3
+        detail = f"Very little procedural context ({matches} procedural reference)"
+    else:
+        pts = 5
+        detail = "No procedural posture detected \u2014 brief lacks procedural history"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+# --- Criterion 10: Overly "helpful explainer" voice (max 5 pts) ---
+
+_EXPLAINER_PHRASES = [
+    r"it is important to note",
+    r"this highlights the significance",
+    r"it should be noted",
+    r"this is particularly relevant",
+    r"it bears mentioning",
+    r"as previously mentioned",
+    r"in today's legal landscape",
+    r"this underscores (?:the|how)",
+    r"delve into",
+    r"shed(?:s|ding)? light on",
+    r"navigat(?:e|ing) the (?:complex|intricate|nuanc)",
+    r"in the realm of",
+    r"it is worth (?:noting|mentioning|emphasizing)",
+    r"this is especially (?:true|important|relevant|significant)",
+    r"one cannot (?:overstate|underestimate|ignore)",
+    r"plays a (?:crucial|vital|pivotal|significant) role",
+    r"it is (?:crucial|essential|vital|imperative) (?:to|that)",
+    r"serves as a (?:reminder|testament|cornerstone)",
+    r"speaks volumes",
+]
+
+
+def _detect_explainer_voice(text: str) -> dict:
+    """Criterion 10: Detect overly 'helpful explainer' voice (max 5 pts)."""
+    text_lower = text.lower()
+    count = 0
+    found = []
+
+    for phrase in _EXPLAINER_PHRASES:
+        hits = re.findall(phrase, text_lower)
+        count += len(hits)
+        if hits and len(found) < 3:
+            found.append(hits[0])
+
+    if count == 0:
+        pts = 0
+        detail = "No 'explainer voice' phrases detected"
+    elif count <= 2:
+        pts = 2
+        detail = f"Some explainer-style language ({count} instance(s))"
+    elif count <= 4:
+        pts = 3
+        detail = f"Noticeable explainer voice ({count} instances)"
+    else:
+        pts = 5
+        detail = (
+            f"Strong explainer voice ({count} instances) \u2014 "
+            "reads more like a blog post than legal advocacy"
+        )
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+# --- Criterion 11: Buzzwordy legal adjectives (max 5 pts) ---
+
+_BUZZWORD_ADJECTIVES = [
+    "well-settled", "well settled", "well-established", "well established",
+    "firmly established", "deeply rooted", "longstanding", "long-standing",
+    "time-honored", "fundamental", "robust", "abundantly clear",
+    "crystal clear", "hornbook law", "black-letter",
+]
+
+
+def _detect_buzzword_adjectives(text: str) -> dict:
+    """Criterion 11: Detect buzzwordy adjectives without authority (max 5 pts)."""
+    text_lower = text.lower()
+    unsupported = 0
+    total = 0
+
+    for bw in _BUZZWORD_ADJECTIVES:
+        for m in re.finditer(re.escape(bw), text_lower):
+            total += 1
+            after = text[m.end():m.end() + 150]
+            has_cite = bool(re.search(r'\d{1,4}\s+\w+\.', after))
+            if not has_cite:
+                unsupported += 1
+
+    if unsupported == 0:
+        pts = 0
+        if total == 0:
+            detail = "No buzzword adjectives found"
+        else:
+            detail = f"All {total} emphatic adjective(s) supported by citations"
+    elif unsupported <= 2:
+        pts = 2
+        detail = f"{unsupported} buzzword adjective(s) without supporting authority"
+    elif unsupported <= 4:
+        pts = 3
+        detail = f"{unsupported} buzzword adjectives without supporting authority"
+    else:
+        pts = 5
+        detail = (
+            f"{unsupported} buzzword adjectives used without citing authority \u2014 "
+            "characteristic of AI-generated text"
+        )
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+# --- Main scoring function ---
+
+def compute_ai_score(text: str, citations: list = None) -> dict:
+    """
+    Compute the AI-generation probability score on a 100-point scale.
+
+    Args:
+        text: Full document text.
+        citations: List of Citation objects with verification results.
+                   If None, citation-based criteria are scored as 0.
+
+    Returns a dict with total_score, auto_flagged, label, and criteria breakdown.
+    """
+    criteria = []
+
+    # Criterion 1: Mismatched citations (max 10)
+    if citations:
+        mismatch_count = sum(1 for c in citations if c.status == "mismatch")
+        if mismatch_count == 0:
+            c1_pts, c1_detail = 0, "All citation names match database records"
+        elif mismatch_count == 1:
+            c1_pts, c1_detail = 5, "1 citation with mismatched case name"
+        else:
+            c1_pts, c1_detail = 10, f"{mismatch_count} citations with mismatched case names"
+    else:
+        c1_pts, c1_detail = 0, "Citations not yet verified"
+
+    criteria.append({
+        "name": "Mismatched Citation Names",
+        "description": "Case names in the brief don\u2019t match the actual case names in the database",
+        "points": c1_pts,
+        "max": 10,
+        "detail": c1_detail,
+    })
+
+    # Criterion 2: Non-existent citations (max 20) — AUTO FLAG
+    auto_flagged = False
+    if citations:
+        not_found = sum(1 for c in citations if c.status == "not_found")
+        if not_found == 0:
+            c2_pts, c2_detail = 0, "All citations found in legal databases"
+        elif not_found == 1:
+            c2_pts = 10
+            c2_detail = "1 citation not found \u2014 may be fabricated"
+            auto_flagged = True
+        else:
+            c2_pts = 20
+            c2_detail = f"{not_found} citations not found \u2014 likely fabricated"
+            auto_flagged = True
+    else:
+        c2_pts, c2_detail = 0, "Citations not yet verified"
+
+    criteria.append({
+        "name": "Non-Existent Case Citations",
+        "description": "Citations that cannot be found in any legal database \u2014 hallmark of AI fabrication",
+        "points": c2_pts,
+        "max": 20,
+        "detail": c2_detail,
+        "auto_flag": auto_flagged,
+    })
+
+    # Criterion 3: Improper formatting
+    c3 = _detect_formatting_issues(text)
+    criteria.append({
+        "name": "Improper Citation Formatting",
+        "description": "Citations with incorrect Bluebook formatting (missing periods, wrong spacing)",
+        "points": c3["points"], "max": c3["max"], "detail": c3["detail"],
+    })
+
+    # Criterion 4: Pro se + legalese
+    c4 = _detect_pro_se_legalese(text)
+    criteria.append({
+        "name": "Pro Se Litigant Using Complex Legalese",
+        "description": "Self-represented litigant\u2019s brief uses unusually sophisticated legal language",
+        "points": c4["points"], "max": c4["max"], "detail": c4["detail"],
+    })
+
+    # Criterion 5: Unusual syntax
+    c5 = _detect_unusual_syntax(text)
+    criteria.append({
+        "name": "Unusual Syntax",
+        "description": "Unnaturally uniform sentence lengths, excessive passive voice, or overly long sentences",
+        "points": c5["points"], "max": c5["max"], "detail": c5["detail"],
+    })
+
+    # Criterion 6: Out-of-jurisdiction
+    c6 = _detect_out_of_jurisdiction(text, citations or [])
+    criteria.append({
+        "name": "Out-of-Jurisdiction Citations",
+        "description": "Citations to cases from courts outside the brief\u2019s jurisdiction",
+        "points": c6["points"], "max": c6["max"], "detail": c6["detail"],
+    })
+
+    # Criterion 7: Sparse record citations
+    c7 = _detect_sparse_record_citations(text)
+    criteria.append({
+        "name": "Sparse Record Citations",
+        "description": "Few or no references to the trial record, docket, or appendix",
+        "points": c7["points"], "max": c7["max"], "detail": c7["detail"],
+    })
+
+    # Criterion 8: Repetition
+    c8 = _detect_repetition(text)
+    criteria.append({
+        "name": "Repetitive Arguments",
+        "description": "Multiple paragraphs making substantially the same point",
+        "points": c8["points"], "max": c8["max"], "detail": c8["detail"],
+    })
+
+    # Criterion 9: Missing procedural posture
+    c9 = _detect_missing_procedural_posture(text)
+    criteria.append({
+        "name": "Missing Procedural Posture",
+        "description": "Brief lacks procedural history (motions, rulings, standard of review)",
+        "points": c9["points"], "max": c9["max"], "detail": c9["detail"],
+    })
+
+    # Criterion 10: Explainer voice
+    c10 = _detect_explainer_voice(text)
+    criteria.append({
+        "name": "Overly \u201cHelpful Explainer\u201d Voice",
+        "description": "Uses blog-post-style phrases instead of legal advocacy language",
+        "points": c10["points"], "max": c10["max"], "detail": c10["detail"],
+    })
+
+    # Criterion 11: Buzzword adjectives
+    c11 = _detect_buzzword_adjectives(text)
+    criteria.append({
+        "name": "Buzzwordy Legal Adjectives",
+        "description": "Overuse of \u201cwell-settled,\u201d \u201crobust,\u201d \u201cfundamental,\u201d etc. without citing authority",
+        "points": c11["points"], "max": c11["max"], "detail": c11["detail"],
+    })
+
+    # Sum and label
+    total = min(sum(c["points"] for c in criteria), 100)
+
+    if total == 0:
+        label = "Not AI generated"
+    elif total <= 10:
+        label = "Low chance of AI generation"
+    elif total <= 30:
+        label = "Moderate chance of some AI generation"
+    elif total <= 50:
+        label = "High chance of some AI generation"
+    elif total <= 80:
+        label = "Moderate chance that entire brief was AI generated"
+    else:
+        label = "High chance that entire brief was AI generated"
+
+    return {
+        "total_score": total,
+        "auto_flagged": auto_flagged,
+        "label": label,
+        "criteria": criteria,
+    }
 
 
 # ---------------------------------------------------------------------------
