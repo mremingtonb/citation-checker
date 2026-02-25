@@ -1886,11 +1886,14 @@ def verify_quote(
         found_cites = first_result.get("citation", [])
         found_cite_str = found_cites[0] if found_cites else ""
         quote.status = "found_elsewhere"
-        quote.found_in = found_name
+        quote.found_in = (
+            f'{found_name}, {found_cite_str}' if found_cite_str
+            else found_name
+        )
         quote.detail = (
             f'Quote not found in cited case. '
             f'Found in: {found_name}'
-            + (f' ({found_cite_str})' if found_cite_str else '')
+            + (f', {found_cite_str}' if found_cite_str else '')
         )
         return quote
 
@@ -1913,7 +1916,7 @@ def verify_quote(
 def _search_google_scholar(phrase: str) -> str | None:
     """Search Google Scholar case law for an exact phrase.
 
-    Returns the case name if found, or None.
+    Returns a string with the case name and citation (if available), or None.
     """
     try:
         from bs4 import BeautifulSoup
@@ -1939,14 +1942,36 @@ def _search_google_scholar(phrase: str) -> str | None:
             return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        # Google Scholar results have class "gs_ri" for result info
-        results = soup.select(".gs_ri .gs_rt")
-        if results:
-            # Extract the first result title (case name)
-            case_name = results[0].get_text(strip=True)
-            # Clean up — remove [PDF] [HTML] prefixes
-            case_name = re.sub(r"^\[(?:PDF|HTML|BOOK)\]\s*", "", case_name)
-            return case_name if case_name else None
+        # Google Scholar results: .gs_ri contains result info
+        result_blocks = soup.select(".gs_ri")
+        if not result_blocks:
+            return None
+
+        first = result_blocks[0]
+
+        # Extract case name from the title element (.gs_rt)
+        title_el = first.select_one(".gs_rt")
+        if not title_el:
+            return None
+        case_name = title_el.get_text(strip=True)
+        case_name = re.sub(r"^\[(?:PDF|HTML|BOOK)\]\s*", "", case_name)
+        if not case_name:
+            return None
+
+        # Extract citation from the "green line" (.gs_a) — e.g.,
+        # "Marbury v. Madison, 5 US 137 - Supreme Court, 1803"
+        cite_str = ""
+        green_line = first.select_one(".gs_a")
+        if green_line:
+            green_text = green_line.get_text(strip=True)
+            # Try to find a citation pattern in the green line
+            cite_match = CITE_STRING_RE.search(green_text)
+            if cite_match:
+                cite_str = cite_match.group(0)
+
+        if cite_str:
+            return f"{case_name}, {cite_str}"
+        return case_name
     except Exception:
         return None
 
