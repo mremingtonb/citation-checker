@@ -412,6 +412,92 @@ HTML_PAGE = """<!DOCTYPE html>
     line-height: 1.5;
   }
 
+  .disclaimer-box {
+    margin-bottom: 1.5rem;
+    padding: 1rem 1.25rem;
+    background: #fff9e6;
+    border: 1px solid #f0d060;
+    border-radius: 8px;
+    font-size: 0.88rem;
+    color: #5a4e00;
+    line-height: 1.6;
+  }
+
+  .options-section {
+    margin-bottom: 1.5rem;
+    background: #fff;
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  .option-group {
+    margin-bottom: 1rem;
+  }
+
+  .option-group:last-child {
+    margin-bottom: 0;
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    font-size: 0.9rem;
+    color: #2d3436;
+    line-height: 1.5;
+    cursor: pointer;
+  }
+
+  .checkbox-label input[type="checkbox"] {
+    margin-top: 0.25rem;
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    cursor: pointer;
+  }
+
+  .option-intro {
+    font-size: 0.9rem;
+    color: #2d3436;
+    line-height: 1.5;
+    margin-bottom: 0.6rem;
+  }
+
+  .sub-option {
+    margin-left: 1.5rem;
+    margin-top: 0.4rem;
+  }
+
+  .privacy-notice {
+    margin-top: 1.5rem;
+    padding: 1rem;
+    background: #edf5ff;
+    border: 1px solid #b2d4f5;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    color: #2d3436;
+    text-align: center;
+  }
+
+  .site-footer {
+    margin-top: 1.5rem;
+    padding: 1.5rem 0;
+    text-align: center;
+    font-size: 0.85rem;
+    color: #636e72;
+    border-top: 1px solid #dfe6e9;
+  }
+
+  .site-footer a {
+    color: #0984e3;
+    text-decoration: none;
+  }
+
+  .site-footer a:hover {
+    text-decoration: underline;
+  }
+
   @media (max-width: 600px) {
     .container { padding: 1rem; }
     th, td { padding: 0.5rem; font-size: 0.8rem; }
@@ -427,6 +513,36 @@ HTML_PAGE = """<!DOCTYPE html>
     <p>Upload a legal brief (.docx or .pdf) to verify whether the brief may be AI generated.</p>
     <p style="font-style: italic; color: #636e72; margin-top: 0.5rem;">Designed by R. Bronson, Esq.</p>
   </header>
+
+  <div class="disclaimer-box">
+    <strong>&#9888; Disclaimer:</strong> Use this checker at the beginning of your workflow.
+    An indication that a brief may be AI generated does not mean that it is. Rather, use this tool
+    to flag the possibility that a brief contains AI generated content and double-check that
+    conclusion yourself. Similarly, an indication that a brief is not AI generated does not mean
+    that it does not, in fact, contain AI generated content. Always rely on your intuition if
+    something seems off.
+  </div>
+
+  <!-- Options -->
+  <div class="options-section">
+    <div class="option-group">
+      <label class="checkbox-label">
+        <input type="checkbox" id="proSeCheck">
+        <span>The checker will attempt to determine if the brief was written by a pro se appellant or appellee. However, if you know that the drafter of the brief is pro se, please check this box.</span>
+      </label>
+    </div>
+    <div class="option-group">
+      <p class="option-intro">The checker will assume that the relevant jurisdiction is Florida. However, if you believe that law from other jurisdictions may properly be raised, please check any of the following boxes:</p>
+      <label class="checkbox-label sub-option">
+        <input type="checkbox" id="otherStateCheck">
+        <span>Other state jurisdictions</span>
+      </label>
+      <label class="checkbox-label sub-option">
+        <input type="checkbox" id="federalCheck">
+        <span>Federal jurisdictions</span>
+      </label>
+    </div>
+  </div>
 
   <!-- Upload -->
   <div class="upload-area" id="uploadArea">
@@ -512,7 +628,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <tbody id="criteriaBody"></tbody>
     </table>
     <div class="methodology-box">
-      <strong>How this score is calculated:</strong> The score is the sum of points across 11 criteria
+      <strong>How this score is calculated:</strong> The score is the sum of points across 13 criteria
       that indicate potential AI generation. Each criterion has a maximum point value based on its
       significance as an AI indicator. Higher total scores indicate greater likelihood that the brief
       was AI-generated. The presence of fabricated (non-existent) case citations automatically flags
@@ -520,6 +636,15 @@ HTML_PAGE = """<!DOCTYPE html>
       were detected.
     </div>
   </div>
+
+  <div class="privacy-notice">
+    &#128274; <strong>Privacy:</strong> Uploaded files are processed in real time and immediately deleted from the server.
+    No documents, text, or citation data are stored after your analysis is complete.
+  </div>
+
+  <footer class="site-footer">
+    <p>If you have ideas for how the AI detector could be improved, including additional or reweighed AI generation factors, please contact the developer at <a href="mailto:Remington.Bronson@gmail.com">Remington.Bronson@gmail.com</a>.</p>
+  </footer>
 </div>
 
 <script>
@@ -611,6 +736,9 @@ async function startCheck() {
 
   const formData = new FormData();
   formData.append('file', selectedFile);
+  formData.append('pro_se', document.getElementById('proSeCheck').checked ? '1' : '0');
+  formData.append('allow_other_state', document.getElementById('otherStateCheck').checked ? '1' : '0');
+  formData.append('allow_federal', document.getElementById('federalCheck').checked ? '1' : '0');
 
   try {
     const resp = await fetch('/upload', { method: 'POST', body: formData });
@@ -834,12 +962,20 @@ def upload():
         except OSError:
             pass
 
+    # Read user-provided options
+    pro_se_manual = request.form.get("pro_se") == "1"
+    allow_other_state = request.form.get("allow_other_state") == "1"
+    allow_federal = request.form.get("allow_federal") == "1"
+
     # Create a job
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {
         "citations": citations,
         "results": [],
         "text": text,
+        "pro_se_manual": pro_se_manual,
+        "allow_other_state": allow_other_state,
+        "allow_federal": allow_federal,
     }
 
     # Return the extracted citations (without verification yet)
@@ -899,9 +1035,18 @@ def verify(job_id):
                 time.sleep(REQUEST_DELAY)
 
         # Compute AI detection score after all citations verified
-        ai_result = compute_ai_score(job.get("text", ""), list(job["results"]))
+        ai_result = compute_ai_score(
+            job.get("text", ""),
+            list(job["results"]),
+            pro_se_override=job.get("pro_se_manual", False),
+            allow_other_state=job.get("allow_other_state", False),
+            allow_federal=job.get("allow_federal", False),
+        )
         done_payload = {"type": "done", "ai_score": ai_result}
         yield f"data: {json.dumps(done_payload)}\n\n"
+
+        # Privacy: remove stored document text immediately after scoring
+        job.pop("text", None)
 
     return Response(
         generate(),
@@ -945,6 +1090,10 @@ def download(job_id):
 
     buf = io.BytesIO(output.getvalue().encode("utf-8"))
     buf.seek(0)
+
+    # Privacy: remove job data after CSV download
+    jobs.pop(job_id, None)
+
     return send_file(
         buf,
         mimetype="text/csv",

@@ -677,14 +677,15 @@ _COMPLEX_LEGAL_TERMS = [
 ]
 
 
-def _detect_pro_se_legalese(text: str) -> dict:
-    """Criterion 4: Pro se litigant using complex legalese (max 20 pts)."""
-    is_pro_se = any(p.search(text) for p in _PRO_SE_PATTERNS)
+def _detect_pro_se_legalese(text: str, pro_se_override: bool = False) -> dict:
+    """Criterion 4: Pro se litigant using complex legalese (max 15 pts)."""
+    auto_detected = any(p.search(text) for p in _PRO_SE_PATTERNS)
+    is_pro_se = pro_se_override or auto_detected
 
     if not is_pro_se:
         return {
             "points": 0,
-            "max": 20,
+            "max": 15,
             "detail": "Pro se status not detected \u2014 criterion skipped",
             "pro_se_detected": False,
         }
@@ -694,7 +695,7 @@ def _detect_pro_se_legalese(text: str) -> dict:
     if word_count < 100:
         return {
             "points": 0,
-            "max": 20,
+            "max": 15,
             "detail": "Pro se detected but document too short to analyze",
             "pro_se_detected": True,
         }
@@ -710,19 +711,20 @@ def _detect_pro_se_legalese(text: str) -> dict:
     if legalese_per_1k < 1:
         pts = 0
     elif legalese_per_1k < 2:
-        pts = 5
+        pts = 4
     elif legalese_per_1k < 3.5:
-        pts = 10
+        pts = 8
     elif legalese_per_1k < 5:
-        pts = 15
+        pts = 12
     else:
-        pts = 20
+        pts = 15
 
+    source = "user-indicated" if pro_se_override else "auto-detected"
     return {
         "points": pts,
-        "max": 20,
+        "max": 15,
         "detail": (
-            f"Pro se brief with {latin_count} Latin phrase(s) and "
+            f"Pro se brief ({source}) with {latin_count} Latin phrase(s) and "
             f"{complex_count} complex legal term(s) "
             f"({legalese_per_1k:.1f} per 1,000 words)"
         ),
@@ -962,24 +964,94 @@ def _citation_is_in_jurisdiction(cite_court: str, jurisdiction: dict) -> bool:
     return True  # Can't determine, assume OK
 
 
-def _detect_out_of_jurisdiction(text: str, citations: list) -> dict:
-    """Criterion 6: Detect out-of-jurisdiction citations (max 10 pts)."""
-    jurisdiction = _detect_jurisdiction(text)
+def _citation_is_out_of_jurisdiction(
+    cite_court: str,
+    jurisdiction: dict,
+    allow_other_state: bool = False,
+    allow_federal: bool = False,
+) -> bool:
+    """Check if a citation's court is outside the acceptable jurisdiction.
 
-    if not jurisdiction.get("type"):
+    Rules (Florida default):
+    - Florida state court → always OK
+    - SCOTUS → always OK
+    - Any federal court (including 11th Cir.) → OK only if allow_federal
+    - Any other state court → OK only if allow_other_state
+    """
+    if not cite_court:
+        return False  # Can't determine, assume OK
+
+    court_lower = cite_court.lower().strip()
+    if not court_lower:
+        return False
+
+    # SCOTUS is always in-jurisdiction
+    # (SCOTUS citations typically have empty court field or just a year)
+
+    # Check if it's a federal court citation
+    is_federal = bool(
+        re.search(r'\d+(?:st|nd|rd|th)?\s*cir', court_lower)
+        or "d.c" in court_lower and "cir" in court_lower
+        or re.search(r'\b[SNEWMC]\.?D\.?\s', cite_court)  # district courts
+    )
+
+    if is_federal:
+        return not allow_federal  # out-of-jurisdiction unless federal allowed
+
+    # Check if it's a Florida state court citation
+    jur_state = jurisdiction.get("state", "fl")
+    for abbrev, state_code in _COURT_STATE_MAP.items():
+        if abbrev in court_lower:
+            if state_code == jur_state:
+                return False  # Same state = in-jurisdiction
+            else:
+                return not allow_other_state  # Other state = depends on flag
+
+    # Check specifically for "Fla" in court field (common Florida abbreviation)
+    if "fla" in court_lower:
+        return False  # Florida citation
+
+    return False  # Can't determine, assume OK
+
+
+def _detect_out_of_jurisdiction(
+    text: str,
+    citations: list,
+    allow_other_state: bool = False,
+    allow_federal: bool = False,
+) -> dict:
+    """Criterion 6: Detect out-of-jurisdiction citations (max 8 pts).
+
+    Defaults to Florida jurisdiction. SCOTUS is always in-jurisdiction.
+    Federal courts (including 11th Cir.) require the allow_federal flag.
+    Other state courts require the allow_other_state flag.
+    """
+    # If user says both other states and federal are OK, skip this criterion
+    if allow_other_state and allow_federal:
         return {
             "points": 0,
-            "max": 10,
-            "detail": "Could not detect brief's jurisdiction \u2014 criterion skipped",
-            "jurisdiction": None,
+            "max": 8,
+            "detail": "All jurisdictions marked as acceptable by user",
+            "jurisdiction": {"type": "state", "state": "fl",
+                             "court_name": "Florida (assumed)"},
+        }
+
+    # Try auto-detecting jurisdiction from header; fall back to Florida
+    jurisdiction = _detect_jurisdiction(text)
+    if not jurisdiction.get("type"):
+        jurisdiction = {
+            "type": "state",
+            "state": "fl",
+            "circuit": "11",
+            "court_name": "Florida (assumed)",
         }
 
     if not citations:
         return {
             "points": 0,
-            "max": 10,
+            "max": 8,
             "detail": (
-                f"Jurisdiction detected: {jurisdiction.get('court_name', 'Unknown')}; "
+                f"Jurisdiction: {jurisdiction.get('court_name', 'Unknown')}; "
                 "no citations to check"
             ),
             "jurisdiction": jurisdiction,
@@ -988,7 +1060,9 @@ def _detect_out_of_jurisdiction(text: str, citations: list) -> dict:
     out_count = 0
     out_examples = []
     for cite in citations:
-        if not _citation_is_in_jurisdiction(cite.court, jurisdiction):
+        if _citation_is_out_of_jurisdiction(
+            cite.court, jurisdiction, allow_other_state, allow_federal
+        ):
             out_count += 1
             if len(out_examples) < 3:
                 out_examples.append(f"{cite.parties} ({cite.court})")
@@ -1003,9 +1077,9 @@ def _detect_out_of_jurisdiction(text: str, citations: list) -> dict:
     elif ratio < 0.6:
         pts = 5
     elif ratio < 0.8:
-        pts = 7
+        pts = 6
     else:
-        pts = 10
+        pts = 8
 
     detail = (
         f"Jurisdiction: {jurisdiction.get('court_name', 'Unknown')}; "
@@ -1014,7 +1088,7 @@ def _detect_out_of_jurisdiction(text: str, citations: list) -> dict:
 
     return {
         "points": pts,
-        "max": 10,
+        "max": 8,
         "detail": detail,
         "jurisdiction": jurisdiction,
     }
@@ -1036,12 +1110,12 @@ _RECORD_PATTERNS = [
 
 
 def _detect_sparse_record_citations(text: str) -> dict:
-    """Criterion 7: Detect sparse record/trial citations (max 5 pts)."""
+    """Criterion 7: Detect sparse record/trial citations (max 4 pts)."""
     word_count = len(text.split())
     if word_count < 500:
         return {
             "points": 0,
-            "max": 5,
+            "max": 4,
             "detail": "Document too short to evaluate record citations",
         }
 
@@ -1049,7 +1123,7 @@ def _detect_sparse_record_citations(text: str) -> dict:
     expected = word_count / 300
 
     if record_count == 0 and word_count > 1000:
-        pts = 5
+        pts = 4
         detail = "No record or docket citations found in a substantive brief"
     elif record_count < expected * 0.2:
         pts = 3
@@ -1061,16 +1135,16 @@ def _detect_sparse_record_citations(text: str) -> dict:
         pts = 0
         detail = f"Adequate record citations ({record_count} found)"
 
-    return {"points": pts, "max": 5, "detail": detail}
+    return {"points": pts, "max": 4, "detail": detail}
 
 
 # --- Criterion 8: Repeating the same point (max 5 pts) ---
 
 def _detect_repetition(text: str) -> dict:
-    """Criterion 8: Detect repetitive arguments (max 5 pts)."""
+    """Criterion 8: Detect repetitive arguments (max 4 pts)."""
     paragraphs = [p.strip() for p in text.split('\n') if len(p.strip()) > 80]
     if len(paragraphs) < 3:
-        return {"points": 0, "max": 5, "detail": "Not enough paragraphs to analyze"}
+        return {"points": 0, "max": 4, "detail": "Not enough paragraphs to analyze"}
 
     _stopwords = {
         "the", "and", "for", "that", "this", "with", "was", "are", "were",
@@ -1105,10 +1179,10 @@ def _detect_repetition(text: str) -> dict:
         pts = 2
         detail = f"Some repetition detected ({high_sim_pairs} similar paragraph pair(s))"
     else:
-        pts = 5
+        pts = 4
         detail = f"Significant repetition ({high_sim_pairs} similar paragraph pairs)"
 
-    return {"points": pts, "max": 5, "detail": detail}
+    return {"points": pts, "max": 4, "detail": detail}
 
 
 # --- Criterion 9: Missing procedural posture (max 5 pts) ---
@@ -1134,10 +1208,10 @@ _PROCEDURAL_PATTERNS = [
 
 
 def _detect_missing_procedural_posture(text: str) -> dict:
-    """Criterion 9: Detect missing procedural posture (max 5 pts)."""
+    """Criterion 9: Detect missing procedural posture (max 4 pts)."""
     word_count = len(text.split())
     if word_count < 500:
-        return {"points": 0, "max": 5, "detail": "Document too short to evaluate"}
+        return {"points": 0, "max": 4, "detail": "Document too short to evaluate"}
 
     matches = sum(1 for p in _PROCEDURAL_PATTERNS if p.search(text))
 
@@ -1151,10 +1225,10 @@ def _detect_missing_procedural_posture(text: str) -> dict:
         pts = 3
         detail = f"Very little procedural context ({matches} procedural reference)"
     else:
-        pts = 5
+        pts = 4
         detail = "No procedural posture detected \u2014 brief lacks procedural history"
 
-    return {"points": pts, "max": 5, "detail": detail}
+    return {"points": pts, "max": 4, "detail": detail}
 
 
 # --- Criterion 10: Overly "helpful explainer" voice (max 5 pts) ---
@@ -1259,9 +1333,108 @@ def _detect_buzzword_adjectives(text: str) -> dict:
     return {"points": pts, "max": 5, "detail": detail}
 
 
+# --- Criterion 12: Excessive em-dashes (max 5 pts) ---
+
+def _detect_excessive_em_dashes(text: str) -> dict:
+    """Criterion 12: Detect excessive em-dash usage (max 5 pts).
+
+    AI-generated text (especially from ChatGPT) tends to overuse em-dashes.
+    More than 4 em-dashes in a legal brief is unusual and suggestive of AI.
+    """
+    # Count both Unicode em-dash and double-hyphen stand-ins
+    em_dash_count = text.count("\u2014")  # —
+    # Also count en-dash used as em-dash (common in AI output)
+    en_dash_count = text.count("\u2013")  # –
+    # Double-hyphens used as em-dashes
+    double_hyphen = len(re.findall(r'(?<!\-)\-\-(?!\-)', text))
+
+    total = em_dash_count + en_dash_count + double_hyphen
+
+    if total <= 4:
+        pts = 0
+        detail = f"{total} em-dash(es) found — within normal range"
+    elif total <= 8:
+        pts = 2
+        detail = f"{total} em-dashes found — somewhat elevated for legal writing"
+    elif total <= 15:
+        pts = 3
+        detail = f"{total} em-dashes found — unusual frequency for legal writing"
+    else:
+        pts = 5
+        detail = (
+            f"{total} em-dashes found — highly unusual for legal writing, "
+            "characteristic of AI-generated text"
+        )
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+# --- Criterion 13: Excessive unnecessary hyphenation (max 5 pts) ---
+
+# Pattern: adverb ending in -ly followed by a hyphen and an adjective/participle.
+# Grammar rule: adverbs ending in -ly should NOT be hyphenated to the word they modify.
+# AI models frequently violate this (e.g., "clearly-established" instead of "clearly established").
+_UNNECESSARY_HYPHEN_LY = re.compile(
+    r'\b(\w+ly)-(\w{3,})\b', re.IGNORECASE
+)
+
+# Words ending in -ly that are NOT adverbs (so hyphenation may be valid)
+_FALSE_LY_ADVERBS = {
+    "family", "only", "holy", "rally", "tally", "daily", "early",
+    "friendly", "lonely", "lovely", "ugly", "likely", "elderly",
+    "supply", "reply", "apply", "ally", "belly", "bully", "folly",
+    "jelly", "jolly", "lily", "rally", "silly", "tally", "wily",
+    "assembly", "homily", "anomaly", "monopoly", "italy",
+}
+
+
+def _detect_unnecessary_hyphens(text: str) -> dict:
+    """Criterion 13: Detect excessive unnecessary hyphenation (max 5 pts).
+
+    AI-generated text tends to over-hyphenate, joining words with hyphens
+    where grammar does not require them. The most reliable signal is
+    hyphenating adverbs ending in -ly to the adjective they modify
+    (e.g., 'clearly-established' should be 'clearly established').
+    """
+    unnecessary_count = 0
+    examples = []
+
+    # Check for -ly adverb hyphenation errors
+    for m in _UNNECESSARY_HYPHEN_LY.finditer(text):
+        adverb = m.group(1).lower()
+        if adverb not in _FALSE_LY_ADVERBS:
+            unnecessary_count += 1
+            if len(examples) < 3:
+                examples.append(f'"{m.group(0)}"')
+
+    if unnecessary_count == 0:
+        pts = 0
+        detail = "No unnecessary hyphenation detected"
+    elif unnecessary_count <= 2:
+        pts = 1
+        detail = f"{unnecessary_count} unnecessarily hyphenated term(s): {'; '.join(examples)}"
+    elif unnecessary_count <= 5:
+        pts = 3
+        detail = f"{unnecessary_count} unnecessarily hyphenated terms: {'; '.join(examples)}"
+    else:
+        pts = 5
+        detail = (
+            f"{unnecessary_count} unnecessarily hyphenated terms found — "
+            f"e.g., {'; '.join(examples)}"
+        )
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
 # --- Main scoring function ---
 
-def compute_ai_score(text: str, citations: list = None) -> dict:
+def compute_ai_score(
+    text: str,
+    citations: list = None,
+    pro_se_override: bool = False,
+    allow_other_state: bool = False,
+    allow_federal: bool = False,
+) -> dict:
     """
     Compute the AI-generation probability score on a 100-point scale.
 
@@ -1269,6 +1442,9 @@ def compute_ai_score(text: str, citations: list = None) -> dict:
         text: Full document text.
         citations: List of Citation objects with verification results.
                    If None, citation-based criteria are scored as 0.
+        pro_se_override: User indicated the drafter is pro se.
+        allow_other_state: User indicated other state jurisdictions are acceptable.
+        allow_federal: User indicated federal jurisdictions are acceptable.
 
     Returns a dict with total_score, auto_flagged, label, and criteria breakdown.
     """
@@ -1329,7 +1505,7 @@ def compute_ai_score(text: str, citations: list = None) -> dict:
     })
 
     # Criterion 4: Pro se + legalese
-    c4 = _detect_pro_se_legalese(text)
+    c4 = _detect_pro_se_legalese(text, pro_se_override=pro_se_override)
     criteria.append({
         "name": "Pro Se Litigant Using Complex Legalese",
         "description": "Self-represented litigant\u2019s brief uses unusually sophisticated legal language",
@@ -1345,7 +1521,11 @@ def compute_ai_score(text: str, citations: list = None) -> dict:
     })
 
     # Criterion 6: Out-of-jurisdiction
-    c6 = _detect_out_of_jurisdiction(text, citations or [])
+    c6 = _detect_out_of_jurisdiction(
+        text, citations or [],
+        allow_other_state=allow_other_state,
+        allow_federal=allow_federal,
+    )
     criteria.append({
         "name": "Out-of-Jurisdiction Citations",
         "description": "Citations to cases from courts outside the brief\u2019s jurisdiction",
@@ -1390,6 +1570,22 @@ def compute_ai_score(text: str, citations: list = None) -> dict:
         "name": "Buzzwordy Legal Adjectives",
         "description": "Overuse of \u201cwell-settled,\u201d \u201crobust,\u201d \u201cfundamental,\u201d etc. without citing authority",
         "points": c11["points"], "max": c11["max"], "detail": c11["detail"],
+    })
+
+    # Criterion 12: Excessive em-dashes
+    c12 = _detect_excessive_em_dashes(text)
+    criteria.append({
+        "name": "Excessive Em-Dashes",
+        "description": "Overuse of em-dashes (\u2014), which AI models use far more frequently than human legal writers",
+        "points": c12["points"], "max": c12["max"], "detail": c12["detail"],
+    })
+
+    # Criterion 13: Unnecessary hyphenation
+    c13 = _detect_unnecessary_hyphens(text)
+    criteria.append({
+        "name": "Excessive Unnecessary Hyphenation",
+        "description": "Words joined with hyphens where grammar doesn\u2019t require them (e.g., \u201cclearly-established\u201d instead of \u201cclearly established\u201d)",
+        "points": c13["points"], "max": c13["max"], "detail": c13["detail"],
     })
 
     # Sum and label
