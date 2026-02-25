@@ -640,14 +640,35 @@ def verify_citation(citation: Citation, session: requests.Session) -> Citation:
                 citation.status = "verified"
                 citation.detail = "Citation found (no case name to cross-check)"
 
-    # --- Step 3: "Did you mean?" suggestion for not-found citations ---
+    # --- Step 3: Google Scholar fallback for not-found citations ---
+    # CourtListener's database is not 100% complete, so double-check
+    # against Google Scholar before declaring a citation not found.
+    if citation.status == "not_found":
+        scholar_case_name = _verify_citation_google_scholar(citation)
+        if scholar_case_name:
+            citation.matched_case_name = scholar_case_name
+            # Check if the case name matches
+            if citation.parties and not _names_match(citation.parties, scholar_case_name):
+                citation.status = "mismatch"
+                citation.detail = (
+                    f"Not in CourtListener, but found on Google Scholar. "
+                    f"Name differs: \"{scholar_case_name}\""
+                )
+            else:
+                citation.status = "verified"
+                citation.detail = (
+                    f"Not in CourtListener, but verified via Google Scholar: "
+                    f"\"{scholar_case_name}\""
+                )
+
+    # --- Step 4: "Did you mean?" suggestion for not-found citations ---
     if citation.status == "not_found":
         suggestion = _suggest_correction(citation, session)
         if suggestion:
             citation.suggestion = suggestion
             citation.detail += f' Did you mean: {suggestion}?'
 
-    # --- Step 4: For mismatches, search by the DB case name to find its
+    # --- Step 5: For mismatches, search by the DB case name to find its
     #     correct citation and check if it's similar to what was given ---
     if citation.status == "mismatch" and citation.matched_case_name:
         suggestion = _suggest_correction(citation, session)
@@ -2156,6 +2177,85 @@ def _search_google_scholar(phrase: str) -> str | None:
         if cite_str:
             return f"{case_name}, {cite_str}"
         return case_name
+    except Exception:
+        return None
+
+    return None
+
+
+def _verify_citation_google_scholar(citation: Citation) -> str | None:
+    """Fallback: verify a citation via Google Scholar when CourtListener has no result.
+
+    Searches Google Scholar case law for the volume/reporter/page string.
+    If a result is found whose citation matches, returns the case name.
+    Returns None if not found or on error.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+
+    cite_str = f"{citation.volume} {citation.reporter} {citation.page}"
+    url = "https://scholar.google.com/scholar"
+    params = {
+        "q": f'"{cite_str}"',
+        "hl": "en",
+        "as_sdt": "2006",  # Case law only
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        result_blocks = soup.select(".gs_ri")
+        if not result_blocks:
+            return None
+
+        our_vol = citation.volume
+        our_rptr_norm = _normalize_reporter(citation.reporter)
+        our_page = citation.page
+
+        for block in result_blocks[:5]:
+            # Extract case name
+            title_el = block.select_one(".gs_rt")
+            if not title_el:
+                continue
+            case_name = title_el.get_text(strip=True)
+            case_name = re.sub(r"^\[(?:PDF|HTML|BOOK)\]\s*", "", case_name)
+
+            # Check the green line for a matching citation
+            green_line = block.select_one(".gs_a")
+            if not green_line:
+                continue
+            green_text = green_line.get_text(strip=True)
+
+            # Look for citation patterns in the green line
+            for m in CITE_STRING_RE.finditer(green_text):
+                vol, rptr, page = m.group(1), m.group(2), m.group(3)
+                if (vol == our_vol
+                        and _normalize_reporter(rptr) == our_rptr_norm
+                        and page == our_page):
+                    return case_name if case_name else "Unknown case"
+
+            # Also check the full result text / snippet for the citation
+            snippet_el = block.select_one(".gs_rs")
+            if snippet_el:
+                snippet_text = snippet_el.get_text(strip=True)
+                for m in CITE_STRING_RE.finditer(snippet_text):
+                    vol, rptr, page = m.group(1), m.group(2), m.group(3)
+                    if (vol == our_vol
+                            and _normalize_reporter(rptr) == our_rptr_norm
+                            and page == our_page):
+                        return case_name if case_name else "Unknown case"
+
     except Exception:
         return None
 
