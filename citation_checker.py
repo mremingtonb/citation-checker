@@ -2022,7 +2022,18 @@ def verify_quote(
          reporter (e.g., So. 2d → Florida courts).
       2. If not found, search CourtListener with no jurisdiction filter.
       3. If still not found, try Google Scholar as a last resort.
+
+    Quotes containing bracketed words (e.g., [emphasis added]) are skipped
+    because the brackets indicate the text has been altered from the original,
+    making exact-match verification unreliable.
     """
+    # Skip quotes that contain bracketed alterations — they won't match
+    # the original text in any database.
+    if re.search(r'\[.*?\w+.*?\]', quote.text):
+        quote.status = "skipped"
+        quote.detail = "Quote contains bracketed alterations — skipped verification"
+        return quote
+
     # Use first ~12 words of the quote for the search
     words = quote.text.split()
     search_phrase = " ".join(words[:12])

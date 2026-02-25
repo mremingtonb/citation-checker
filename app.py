@@ -515,6 +515,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .badge-verified       { background: #d4edda; color: #155724; }
   .badge-found_elsewhere { background: #fff3cd; color: #856404; }
   .badge-not_in_case    { background: #ffe0b2; color: #e65100; }
+  .badge-skipped        { background: #e2e3e5; color: #383d41; }
 
   /* Human Error Section */
   .human-error-section {
@@ -1011,6 +1012,7 @@ function startVerification(jobId, total) {
         verified: 'Verified',
         found_elsewhere: 'Found Elsewhere',
         not_found: 'Not Found',
+        skipped: 'Skipped (brackets)',
         pending: 'Pending',
       };
 
@@ -1684,11 +1686,13 @@ def download_docx(job_id):
             "verified": "Verified",
             "found_elsewhere": "Found Elsewhere",
             "not_found": "Not Found",
+            "skipped": "Skipped (brackets)",
         }
         q_status_colors = {
             "verified": (21, 87, 36),
             "found_elsewhere": (133, 100, 4),
             "not_found": (114, 28, 36),
+            "skipped": (56, 61, 65),
         }
 
         q_table = doc.add_table(rows=1, cols=5)
