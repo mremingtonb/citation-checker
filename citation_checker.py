@@ -479,30 +479,143 @@ def _citations_are_similar(
     return total_dist <= 3
 
 
-def _suggest_correction_google_scholar(citation: Citation) -> str | None:
-    """Search Google Scholar by case name to suggest a corrected citation.
+def _extract_party_keywords(parties: str) -> list[str]:
+    """Extract distinctive keywords from party names for search.
 
-    Fallback for when CourtListener doesn't have the case at all.
-    Searches Scholar for the party names, then checks if any result has
-    a citation with the same reporter and close volume/page numbers.
+    Strips common legal filler words, returning just the distinctive
+    names (e.g., 'Florida Department of Health v. United for Medical
+    Marijuana' → ['Florida', 'Department', 'Health', 'Medical', 'Marijuana']).
     """
+    cleaned = re.sub(r"[^\w\s]", " ", parties)
+    stopwords = {
+        "v", "vs", "the", "of", "in", "re", "ex", "parte", "et", "al",
+        "a", "an", "and", "for", "on", "by", "no", "inc", "corp",
+        "co", "ltd", "llc", "city", "state", "united", "states",
+    }
+    words = [w for w in cleaned.split() if w.lower() not in stopwords and len(w) > 1]
+    return words
+
+
+def _check_cite_similarity(
+    cite_strings: list, citation: Citation
+) -> tuple[str | None, int]:
+    """Check a list of citation strings for one similar to the given citation.
+
+    Returns (best_suggestion, best_distance) or (None, 999).
+    """
+    our_reporter_norm = _normalize_reporter(citation.reporter)
+    best_suggestion = None
+    best_distance = 999
+
+    for cite_str in cite_strings:
+        if not isinstance(cite_str, str):
+            continue
+        m = CITE_STRING_RE.search(cite_str)
+        if not m:
+            continue
+        vol, rptr, page = m.group(1), m.group(2), m.group(3)
+        if _normalize_reporter(rptr) != our_reporter_norm:
+            continue
+        vol_dist = _edit_distance(citation.volume, vol)
+        page_dist = _edit_distance(citation.page, page)
+        total_dist = vol_dist + page_dist
+        if 0 < total_dist <= 3 and total_dist < best_distance:
+            best_distance = total_dist
+            best_suggestion = f"{vol} {rptr} {page}"
+
+    return best_suggestion, best_distance
+
+
+def _suggest_correction(
+    citation: Citation, session: requests.Session
+) -> str | None:
+    """Search for the case by name to suggest a corrected citation.
+
+    When a citation is not found, this searches by party names to find
+    the actual case, then checks if any of its real citations are close
+    to the mistyped one (same reporter, edit distance ≤ 3 on volume/page).
+
+    Search strategy (tries each until a suggestion is found):
+      1. CourtListener exact case-name phrase search
+      2. CourtListener keyword search (just distinctive party names)
+      3. Google Scholar case-name search
+
+    Returns the suggested citation string, or None.
+    """
+    if not citation.parties or len(citation.parties.strip()) < 3:
+        return None
+
+    parties_clean = re.sub(r"[^\w\s]", " ", citation.parties).strip()
+    if len(parties_clean) > 80:
+        parties_clean = parties_clean[:80]
+
+    best_suggestion = None
+    best_distance = 999
+
+    # --- Strategy 1: CourtListener exact case-name phrase search ---
+    time.sleep(REQUEST_DELAY)
+    try:
+        resp = session.get(
+            SEARCH_URL,
+            params={"q": f'caseName:("{parties_clean}")', "type": "o"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", [])
+            for result in results[:10]:
+                cite_strings = result.get("citation", [])
+                suggestion, dist = _check_cite_similarity(cite_strings, citation)
+                if suggestion and dist < best_distance:
+                    best_distance = dist
+                    best_suggestion = suggestion
+    except Exception:
+        pass
+
+    if best_suggestion:
+        return best_suggestion
+
+    # --- Strategy 2: CourtListener keyword search (looser matching) ---
+    # Extract just the distinctive words from party names for a broader
+    # search that can match even if the exact name format differs.
+    keywords = _extract_party_keywords(citation.parties)
+    if len(keywords) >= 2:
+        keyword_query = " ".join(keywords[:6])  # Use top 6 distinctive words
+        time.sleep(REQUEST_DELAY)
+        try:
+            resp = session.get(
+                SEARCH_URL,
+                params={"q": f'caseName:({keyword_query})', "type": "o"},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                for result in results[:10]:
+                    cite_strings = result.get("citation", [])
+                    suggestion, dist = _check_cite_similarity(cite_strings, citation)
+                    if suggestion and dist < best_distance:
+                        best_distance = dist
+                        best_suggestion = suggestion
+        except Exception:
+            pass
+
+    if best_suggestion:
+        return best_suggestion
+
+    # --- Strategy 3: Google Scholar case-name search ---
     try:
         from bs4 import BeautifulSoup
     except ImportError:
         return None
 
-    if not citation.parties or len(citation.parties.strip()) < 3:
-        return None
+    # Try multiple search queries on Scholar
+    scholar_queries = [
+        f'"{citation.parties}"',                          # exact name
+        f'{citation.parties} {citation.reporter}',        # name + reporter
+        " ".join(keywords[:5]) + f" {citation.reporter}", # keywords + reporter
+    ]
 
-    # Build search query: case name + reporter to narrow results
-    query = f'{citation.parties} {citation.reporter}'
-
-    url = "https://scholar.google.com/scholar"
-    params = {
-        "q": query,
-        "hl": "en",
-        "as_sdt": "2006",  # Case law only
-    }
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -510,117 +623,38 @@ def _suggest_correction_google_scholar(citation: Citation) -> str | None:
         ),
     }
 
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        result_blocks = soup.select(".gs_ri")
-        if not result_blocks:
-            return None
-
-        our_reporter_norm = _normalize_reporter(citation.reporter)
-        best_suggestion = None
-        best_distance = 999
-
-        for block in result_blocks[:5]:
-            # Check the green line for citations
-            green_line = block.select_one(".gs_a")
-            if not green_line:
+    for query in scholar_queries:
+        if best_suggestion:
+            break
+        try:
+            resp = requests.get(
+                "https://scholar.google.com/scholar",
+                params={"q": query, "hl": "en", "as_sdt": "2006"},
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code != 200:
                 continue
-            green_text = green_line.get_text(strip=True)
 
-            for m in CITE_STRING_RE.finditer(green_text):
-                vol, rptr, page = m.group(1), m.group(2), m.group(3)
-                if _normalize_reporter(rptr) != our_reporter_norm:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            result_blocks = soup.select(".gs_ri")
+
+            for block in result_blocks[:5]:
+                # Check the green line for citations
+                green_line = block.select_one(".gs_a")
+                if not green_line:
                     continue
-                vol_dist = _edit_distance(citation.volume, vol)
-                page_dist = _edit_distance(citation.page, page)
-                total_dist = vol_dist + page_dist
-                if 0 < total_dist <= 3 and total_dist < best_distance:
-                    best_distance = total_dist
-                    best_suggestion = f"{vol} {rptr} {page}"
+                green_text = green_line.get_text(strip=True)
 
-        return best_suggestion
-    except Exception:
-        return None
-
-
-def _suggest_correction(
-    citation: Citation, session: requests.Session
-) -> str | None:
-    """Search CourtListener by case name to suggest a corrected citation.
-
-    When a citation is not found, this searches by party names to find the
-    actual case, then checks if any of its real citations are close to the
-    mistyped one (same reporter, edit distance ≤ 2 on volume/page).
-    Returns the suggested citation string, or None.
-    """
-    if not citation.parties or len(citation.parties.strip()) < 3:
-        return None
-
-    # Rate-limit before the extra API call
-    time.sleep(REQUEST_DELAY)
-
-    # Build search query from party names
-    parties_clean = re.sub(r"[^\w\s]", " ", citation.parties).strip()
-    # Truncate long names
-    if len(parties_clean) > 80:
-        parties_clean = parties_clean[:80]
-
-    try:
-        resp = session.get(
-            SEARCH_URL,
-            params={"q": f'caseName:("{parties_clean}")', "type": "o"},
-            timeout=30,
-        )
-    except requests.RequestException:
-        return None
-
-    if resp.status_code != 200:
-        return None
-
-    try:
-        data = resp.json()
-    except ValueError:
-        return None
-
-    results = data.get("results", [])
-    if not results:
-        return None
-
-    our_reporter_norm = _normalize_reporter(citation.reporter)
-    best_suggestion = None
-    best_distance = 999
-
-    for result in results[:10]:  # Check top 10 results
-        cite_strings = result.get("citation", [])
-        if not cite_strings:
+                cite_strings = [m.group(0) for m in CITE_STRING_RE.finditer(green_text)]
+                suggestion, dist = _check_cite_similarity(cite_strings, citation)
+                if suggestion and dist < best_distance:
+                    best_distance = dist
+                    best_suggestion = suggestion
+        except Exception:
             continue
-        for cite_str in cite_strings:
-            m = CITE_STRING_RE.search(cite_str)
-            if not m:
-                continue
-            vol, rptr, page = m.group(1), m.group(2), m.group(3)
-            if _normalize_reporter(rptr) != our_reporter_norm:
-                continue
-            # Same reporter — check if volume/page are close
-            vol_dist = _edit_distance(citation.volume, vol)
-            page_dist = _edit_distance(citation.page, page)
-            total_dist = vol_dist + page_dist
-            # Must be different but close (edit distance 1-3 on combined vol+page)
-            if 0 < total_dist <= 3 and total_dist < best_distance:
-                best_distance = total_dist
-                best_suggestion = f"{vol} {rptr} {page}"
 
-    if best_suggestion:
-        return best_suggestion
-
-    # --- Fallback: search Google Scholar by case name ---
-    # If CourtListener doesn't have the case, Scholar might.
-    scholar_suggestion = _suggest_correction_google_scholar(citation)
-    return scholar_suggestion
+    return best_suggestion
 
 
 def verify_citation(citation: Citation, session: requests.Session) -> Citation:
