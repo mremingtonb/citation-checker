@@ -1013,7 +1013,7 @@ function startVerification(jobId, total) {
 
       tr.innerHTML =
         '<td>' + (data.index + 1) + '</td>' +
-        '<td class="quote-text-cell" onclick="this.classList.toggle(\'expanded\')" title="Click to expand">' +
+        '<td class="quote-text-cell" onclick="this.classList.toggle(&#39;expanded&#39;)" title="Click to expand">' +
           escHtml(q.text.substring(0, 120)) + (q.text.length > 120 ? '...' : '') +
         '</td>' +
         '<td><span style="color:#636e72;font-size:0.85rem">' + escHtml(q.cite_label) + '</span></td>' +

@@ -467,64 +467,62 @@ def verify_citation(citation: Citation, session: requests.Session) -> Citation:
         citation.detail = f"Invalid JSON response (HTTP {resp.status_code})"
         return citation
 
+    # --- Step 2: Parse response and determine status ---
     # data is a list of citation result objects
     if not data:
         citation.status = "not_found"
         citation.detail = "No results from citation lookup"
-        return citation
+    else:
+        # Find the result matching our citation
+        matched_result = None
+        for result in data:
+            if isinstance(result, dict):
+                status_code = result.get("status")
+                if status_code == 200:
+                    matched_result = result
+                    break
+                elif status_code == 300:
+                    matched_result = result
+                    break
+                elif status_code == 404:
+                    citation.status = "not_found"
+                    citation.detail = "Citation not found in CourtListener database"
+                elif status_code == 400:
+                    citation.status = "unrecognized"
+                    citation.detail = result.get("error_message", "Unrecognized reporter")
+                    return citation
 
-    # Find the result matching our citation
-    matched_result = None
-    for result in data:
-        if isinstance(result, dict):
-            status_code = result.get("status")
-            if status_code == 200:
-                matched_result = result
-                break
-            elif status_code == 300:
-                matched_result = result
-                break
-            elif status_code == 404:
-                citation.status = "not_found"
-                citation.detail = "Citation not found in CourtListener database"
-                return citation
-            elif status_code == 400:
-                citation.status = "unrecognized"
-                citation.detail = result.get("error_message", "Unrecognized reporter")
-                return citation
-
-    if matched_result is None:
-        # If the response is a single object (not a list)
-        if isinstance(data, dict):
-            clusters = data.get("clusters", [])
-            if clusters:
-                matched_result = data
+        if matched_result is None and citation.status == "pending":
+            # If the response is a single object (not a list)
+            if isinstance(data, dict):
+                clusters = data.get("clusters", [])
+                if clusters:
+                    matched_result = data
+                else:
+                    citation.status = "not_found"
+                    citation.detail = "No matching clusters found"
             else:
                 citation.status = "not_found"
-                citation.detail = "No matching clusters found"
-                return citation
-        else:
-            citation.status = "not_found"
-            citation.detail = "No valid match in API response"
-            return citation
+                citation.detail = "No valid match in API response"
 
-    # Extract the matched case name from clusters
-    clusters = matched_result.get("clusters", [])
-    if clusters:
-        cluster = clusters[0]
-        case_name = cluster.get("caseName", "") or cluster.get("case_name", "")
-        citation.matched_case_name = case_name
+        # Extract the matched case name from clusters
+        if matched_result is not None:
+            clusters = matched_result.get("clusters", [])
+            if clusters:
+                cluster = clusters[0]
+                case_name = cluster.get("caseName", "") or cluster.get("case_name", "")
+                citation.matched_case_name = case_name
 
-        # Compare case names for mismatch detection
-        if case_name and not _names_match(citation.parties, case_name):
-            citation.status = "mismatch"
-            citation.detail = f"Citation exists but name differs: \"{case_name}\""
-        else:
-            citation.status = "verified"
-            citation.detail = f"Matches: \"{case_name}\""
-    else:
-        citation.status = "verified"
-        citation.detail = "Citation found (no case name to cross-check)"
+                # Compare case names for mismatch detection
+                if case_name and not _names_match(citation.parties, case_name):
+                    citation.status = "mismatch"
+                    citation.detail = f"Citation exists but name differs: \"{case_name}\""
+                else:
+                    citation.status = "verified"
+                    citation.detail = f"Matches: \"{case_name}\""
+            else:
+                citation.status = "verified"
+                citation.detail = "Citation found (no case name to cross-check)"
 
     # --- Step 3: "Did you mean?" suggestion for not-found citations ---
     if citation.status == "not_found":
