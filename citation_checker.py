@@ -59,6 +59,7 @@ class Quote:
     cite_label: str            # e.g., "123 So. 2d 456"
     status: str = "pending"    # pending / verified / not_in_case / found_elsewhere / not_found
     found_in: str = ""         # Case name where actually found (if misattributed)
+    found_cite: str = ""       # Raw citation string where quote was actually found
     detail: str = ""
 
 
@@ -363,6 +364,121 @@ def _normalize_reporter(r: str) -> str:
     return re.sub(r"\s+", "", r).lower()
 
 
+# ---------------------------------------------------------------------------
+# Reporter → jurisdiction mapping for jurisdiction-aware quote searching
+# ---------------------------------------------------------------------------
+
+# Maps normalized reporter abbreviations to CourtListener court filter strings.
+# CourtListener search supports a "court" parameter for filtering by jurisdiction.
+REPORTER_JURISDICTION = {
+    # Florida
+    "so.": "fla", "so.2d": "fla", "so.3d": "fla",
+    # New York
+    "n.y.s.": "ny", "n.y.s.2d": "ny", "n.y.s.3d": "ny",
+    # California
+    "cal.rptr.": "ca", "cal.rptr.2d": "ca", "cal.rptr.3d": "ca",
+    # Northeast
+    "n.e.": "northeast", "n.e.2d": "northeast", "n.e.3d": "northeast",
+    # Northwest
+    "n.w.": "northwest", "n.w.2d": "northwest",
+    # Southeast
+    "s.e.": "southeast", "s.e.2d": "southeast",
+    # Southwest
+    "s.w.": "southwest", "s.w.2d": "southwest", "s.w.3d": "southwest",
+    # Pacific
+    "p.": "pacific", "p.2d": "pacific", "p.3d": "pacific",
+    # Atlantic
+    "a.": "atlantic", "a.2d": "atlantic", "a.3d": "atlantic",
+    # Illinois
+    "ill.dec.": "il", "ill.2d": "il",
+    # Ohio
+    "ohiost.2d": "oh", "ohiost.3d": "oh",
+    # Pennsylvania
+    "pa.super.": "pa",
+    # Washington
+    "wash.2d": "wa", "wash.app.": "wa",
+    # Wisconsin
+    "wis.2d": "wi",
+    # Michigan
+    "mich.app.": "mi",
+    # Massachusetts
+    "mass.app.ct.": "ma",
+}
+
+# CourtListener court IDs for state jurisdictions
+# Used to build the "court" parameter for CourtListener search API
+JURISDICTION_COURTS = {
+    "fla": "flaapp fla fladistctapp flasupct",
+    "ny": "nyappdiv nyappterm ny nysupct",
+    "ca": "calctapp cal",
+    "il": "illappct ill",
+    "oh": "ohioctapp ohio",
+    "pa": "pasuperct pa",
+    "wa": "washctapp wash",
+    "wi": "wisctapp wis",
+    "mi": "michctapp mich",
+    "ma": "massappct mass",
+    # Regional reporters cover multiple states — use broader search
+    "northeast": "",
+    "northwest": "",
+    "southeast": "",
+    "southwest": "",
+    "pacific": "",
+    "atlantic": "",
+}
+
+
+def _get_jurisdiction_courts(reporter: str) -> str:
+    """Return CourtListener court filter string based on the reporter.
+
+    For state-specific reporters (e.g., So. 2d → Florida), returns the
+    court IDs to filter search results to that jurisdiction.
+    Returns empty string if no specific jurisdiction can be determined.
+    """
+    norm = _normalize_reporter(reporter)
+    jurisdiction = REPORTER_JURISDICTION.get(norm, "")
+    if not jurisdiction:
+        return ""
+    return JURISDICTION_COURTS.get(jurisdiction, "")
+
+
+def _citations_are_similar(
+    cite_label: str, found_cite_str: str
+) -> bool:
+    """Check if two citation strings are similar enough to indicate human error.
+
+    Compares the reporter (must match) and volume/page numbers (must be
+    close by edit distance — like a typo).
+
+    Examples:
+        "123 So. 2d 456" vs "213 So. 2d 456" → True  (transposed digits)
+        "123 So. 2d 456" vs "987 P.3d 777"   → False  (different reporter)
+    """
+    m_given = CITE_STRING_RE.search(cite_label)
+    m_found = CITE_STRING_RE.search(found_cite_str)
+
+    if not m_given or not m_found:
+        return False
+
+    given_vol, given_rptr, given_page = m_given.group(1), m_given.group(2), m_given.group(3)
+    found_vol, found_rptr, found_page = m_found.group(1), m_found.group(2), m_found.group(3)
+
+    # Reporter must match (same reporter family)
+    if _normalize_reporter(given_rptr) != _normalize_reporter(found_rptr):
+        return False
+
+    # If volume AND page are identical, the citations are the same (not an error)
+    if given_vol == found_vol and given_page == found_page:
+        return True
+
+    # Volume and page must be close (edit distance ≤ 3 combined)
+    vol_dist = _edit_distance(given_vol, found_vol)
+    page_dist = _edit_distance(given_page, found_page)
+    total_dist = vol_dist + page_dist
+
+    return total_dist <= 3
+
+
 def _suggest_correction(
     citation: Citation, session: requests.Session
 ) -> str | None:
@@ -530,6 +646,14 @@ def verify_citation(citation: Citation, session: requests.Session) -> Citation:
         if suggestion:
             citation.suggestion = suggestion
             citation.detail += f' Did you mean: {suggestion}?'
+
+    # --- Step 4: For mismatches, search by the DB case name to find its
+    #     correct citation and check if it's similar to what was given ---
+    if citation.status == "mismatch" and citation.matched_case_name:
+        suggestion = _suggest_correction(citation, session)
+        if suggestion:
+            citation.suggestion = suggestion
+            citation.detail += f' Correct citation may be: {suggestion}.'
 
     return citation
 
@@ -1821,80 +1945,127 @@ def extract_quotes(text: str, citations: list) -> list:
     return quotes
 
 
+def _search_courtlistener_for_quote(
+    search_phrase: str, session: requests.Session, court_filter: str = ""
+) -> list | None:
+    """Search CourtListener for an exact phrase, optionally filtered by court.
+
+    Returns the list of result dicts, or None on error.
+    """
+    time.sleep(REQUEST_DELAY)
+    try:
+        params = {"q": f'"{search_phrase}"', "type": "o"}
+        if court_filter:
+            params["court"] = court_filter
+        resp = session.get(SEARCH_URL, params=params, timeout=30)
+    except requests.RequestException:
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    return data.get("results", [])
+
+
+def _check_results_for_cited_case(
+    results: list, citation: Citation
+) -> str | None:
+    """Check if any search result matches the cited citation.
+
+    Returns the case name if found, or None.
+    """
+    our_cite_norm = _normalize_reporter(citation.reporter)
+    for result in results[:10]:
+        case_name = result.get("caseName", "") or ""
+        cite_strings = result.get("citation", [])
+        for cite_str in cite_strings:
+            m = CITE_STRING_RE.search(cite_str)
+            if not m:
+                continue
+            vol, rptr, page = m.group(1), m.group(2), m.group(3)
+            if (vol == citation.volume
+                    and _normalize_reporter(rptr) == our_cite_norm
+                    and page == citation.page):
+                return case_name
+    return None
+
+
+def _extract_found_elsewhere(results: list) -> tuple[str, str]:
+    """Extract case name and citation string from first search result.
+
+    Returns (display_string, raw_cite_string) tuple.
+    """
+    first_result = results[0]
+    found_name = first_result.get("caseName", "unknown case")
+    found_cites = first_result.get("citation", [])
+    found_cite_str = found_cites[0] if found_cites else ""
+
+    display = (
+        f'{found_name}, {found_cite_str}' if found_cite_str
+        else found_name
+    )
+    return display, found_cite_str
+
+
 def verify_quote(
     quote: Quote, citation: Citation, session: requests.Session
 ) -> Quote:
     """Verify a quoted passage against CourtListener and Google Scholar.
 
-    Step 1: Search CourtListener for the exact phrase.
-    Step 2: Check if found in the cited case or elsewhere.
-    Step 3: If not in CourtListener, try Google Scholar.
+    Search order (jurisdiction-first):
+      1. Search CourtListener filtered to the same jurisdiction as the cited
+         reporter (e.g., So. 2d → Florida courts).
+      2. If not found, search CourtListener with no jurisdiction filter.
+      3. If still not found, try Google Scholar as a last resort.
     """
     # Use first ~12 words of the quote for the search
     words = quote.text.split()
     search_phrase = " ".join(words[:12])
 
-    # --- Step 1: Search CourtListener ---
-    time.sleep(REQUEST_DELAY)
-    try:
-        resp = session.get(
-            SEARCH_URL,
-            params={"q": f'"{search_phrase}"', "type": "o"},
-            timeout=30,
+    # Determine jurisdiction filter from the reporter
+    court_filter = _get_jurisdiction_courts(citation.reporter)
+
+    # --- Step 1: Search CourtListener (jurisdiction-filtered first) ---
+    all_results = []
+
+    if court_filter:
+        # First: search within the same jurisdiction
+        juris_results = _search_courtlistener_for_quote(
+            search_phrase, session, court_filter
         )
-    except requests.RequestException:
-        quote.status = "not_found"
-        quote.detail = "Search request failed"
-        return quote
+        if juris_results:
+            # Check if found in the cited case
+            matched_name = _check_results_for_cited_case(juris_results, citation)
+            if matched_name:
+                quote.status = "verified"
+                quote.detail = f'Quote verified in {matched_name}'
+                return quote
+            all_results = juris_results
 
-    if resp.status_code != 200:
-        quote.status = "not_found"
-        quote.detail = f"Search returned HTTP {resp.status_code}"
-        return quote
+    # Second: search CourtListener broadly (no jurisdiction filter)
+    broad_results = _search_courtlistener_for_quote(search_phrase, session)
+    if broad_results:
+        matched_name = _check_results_for_cited_case(broad_results, citation)
+        if matched_name:
+            quote.status = "verified"
+            quote.detail = f'Quote verified in {matched_name}'
+            return quote
+        # Prefer jurisdiction results if available, else use broad results
+        if not all_results:
+            all_results = broad_results
 
-    try:
-        data = resp.json()
-    except ValueError:
-        quote.status = "not_found"
-        quote.detail = "Invalid search response"
-        return quote
-
-    results = data.get("results", [])
-
-    if results:
-        # Check if any result matches the cited citation
-        our_cite_norm = _normalize_reporter(citation.reporter)
-        for result in results[:10]:
-            case_name = result.get("caseName", "") or ""
-            cite_strings = result.get("citation", [])
-            for cite_str in cite_strings:
-                m = CITE_STRING_RE.search(cite_str)
-                if not m:
-                    continue
-                vol, rptr, page = m.group(1), m.group(2), m.group(3)
-                if (vol == citation.volume
-                        and _normalize_reporter(rptr) == our_cite_norm
-                        and page == citation.page):
-                    # Found in the cited case!
-                    quote.status = "verified"
-                    quote.detail = f'Quote verified in {case_name}'
-                    return quote
-
+    if all_results:
         # Found in CourtListener but NOT in the cited case
-        first_result = results[0]
-        found_name = first_result.get("caseName", "unknown case")
-        found_cites = first_result.get("citation", [])
-        found_cite_str = found_cites[0] if found_cites else ""
+        display, found_cite_str = _extract_found_elsewhere(all_results)
         quote.status = "found_elsewhere"
-        quote.found_in = (
-            f'{found_name}, {found_cite_str}' if found_cite_str
-            else found_name
-        )
-        quote.detail = (
-            f'Quote not found in cited case. '
-            f'Found in: {found_name}'
-            + (f', {found_cite_str}' if found_cite_str else '')
-        )
+        quote.found_in = display
+        quote.found_cite = found_cite_str  # Raw citation for similarity comparison
+        quote.detail = f'Quote not found in cited case. Found in: {display}'
         return quote
 
     # --- Step 2: Try Google Scholar as fallback ---
@@ -1903,6 +2074,9 @@ def verify_quote(
         if scholar_result:
             quote.status = "found_elsewhere"
             quote.found_in = scholar_result
+            # Try to extract raw citation from the scholar result string
+            scholar_cite_match = CITE_STRING_RE.search(scholar_result)
+            quote.found_cite = scholar_cite_match.group(0) if scholar_cite_match else ""
             quote.detail = f'Not in CourtListener. Found via Google Scholar in: {scholar_result}'
             return quote
     except Exception:
@@ -1991,6 +2165,14 @@ def compute_human_error_adjustment(
       - adjustment: net point change (negative = likely human error)
       - items: list of {description, classification, points} dicts
       - Each item is either 'human_error' or 'ai_indicator'
+
+    For quotes found elsewhere, compares the found citation against the
+    attributed citation.  Only classifies as human_error if citations are
+    similar (same reporter, close volume/page — like a typo).  Otherwise
+    it's an AI indicator.
+
+    For case-name mismatches, checks if the correct citation for that case
+    name is similar to the one given in the brief.
     """
     items = []
 
@@ -2014,18 +2196,59 @@ def compute_human_error_adjustment(
                 "classification": "ai_indicator",
                 "points": 0,  # Already scored by criterion #2
             })
+        elif cite.status == "mismatch" and cite.suggestion:
+            # Case name mismatch AND we found a suggestion — check similarity
+            given_cite = f"{cite.volume} {cite.reporter} {cite.page}"
+            if _citations_are_similar(given_cite, cite.suggestion):
+                items.append({
+                    "description": (
+                        f"Case name mismatch for {given_cite} "
+                        f"(found \"{cite.matched_case_name}\") — "
+                        f"correct citation may be {cite.suggestion}; "
+                        f"similar citation suggests human error"
+                    ),
+                    "classification": "human_error",
+                    "points": -5,
+                })
+            else:
+                items.append({
+                    "description": (
+                        f"Case name mismatch for {given_cite} "
+                        f"(found \"{cite.matched_case_name}\") — "
+                        f"correct citation is {cite.suggestion}; "
+                        f"citations are too different for a simple typo"
+                    ),
+                    "classification": "ai_indicator",
+                    "points": 3,
+                })
 
-    # Check quotes
+    # Check quotes: found_elsewhere → compare citations for similarity
     for q in (quotes or []):
         if q.status == "found_elsewhere":
-            items.append({
-                "description": (
-                    f'Quote attributed to {q.cite_label} was actually found in: '
-                    f'{q.found_in}'
-                ),
-                "classification": "human_error",
-                "points": -5,
-            })
+            # Build the attributed citation string for comparison
+            attributed_cite = q.cite_label
+            found_cite = q.found_cite  # Raw citation of where quote was found
+
+            if found_cite and _citations_are_similar(attributed_cite, found_cite):
+                # Same reporter, close volume/page — likely a typo
+                items.append({
+                    "description": (
+                        f'Quote attributed to {q.cite_label} was actually found in: '
+                        f'{q.found_in} — citations are similar (likely human error)'
+                    ),
+                    "classification": "human_error",
+                    "points": -5,
+                })
+            else:
+                # Different reporter or wildly different numbers — not a typo
+                items.append({
+                    "description": (
+                        f'Quote attributed to {q.cite_label} was actually found in: '
+                        f'{q.found_in} — citations are too different for a simple typo'
+                    ),
+                    "classification": "ai_indicator",
+                    "points": 5,
+                })
         elif q.status == "not_found":
             items.append({
                 "description": (
