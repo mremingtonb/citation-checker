@@ -688,6 +688,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="results-header">
       <h2>Citations Found</h2>
       <button class="btn btn-secondary" id="csvBtn" disabled>Download CSV</button>
+      <button class="btn btn-secondary" id="docxBtn" disabled>Download Report (.docx)</button>
     </div>
     <table>
       <thead>
@@ -814,6 +815,7 @@ const progressBar = document.getElementById('progressBar');
 const resultsSection = document.getElementById('resultsSection');
 const resultsBody = document.getElementById('resultsBody');
 const csvBtn = document.getElementById('csvBtn');
+const docxBtn = document.getElementById('docxBtn');
 const summarySection = document.getElementById('summarySection');
 const warningBanner = document.getElementById('warningBanner');
 
@@ -876,6 +878,7 @@ function resetUI() {
   warningBanner.style.display = 'none';
   progressBar.style.width = '0%';
   csvBtn.disabled = true;
+  docxBtn.disabled = true;
   document.getElementById('aiScoreSection').style.display = 'none';
   document.getElementById('flaggedBanner').style.display = 'none';
   document.getElementById('quoteSection').style.display = 'none';
@@ -1051,6 +1054,12 @@ function startVerification(jobId, total) {
       csvBtn.disabled = false;
       csvBtn.onclick = () => {
         window.location.href = '/download/' + jobId;
+      };
+
+      // Enable .docx report download
+      docxBtn.disabled = false;
+      docxBtn.onclick = () => {
+        window.location.href = '/download-docx/' + jobId;
       };
 
       // Display AI detection score
@@ -1347,6 +1356,10 @@ def verify(job_id):
             list(job.get("quote_results", [])),
         )
 
+        # Store scores on job so download routes can access them
+        job["ai_score"] = ai_result
+        job["human_error"] = human_error
+
         done_payload = {
             "type": "done",
             "ai_score": ai_result,
@@ -1429,6 +1442,385 @@ def download(job_id):
         mimetype="text/csv",
         as_attachment=True,
         download_name="citation_results.csv",
+    )
+
+
+# ---------------------------------------------------------------------------
+# .docx report download
+# ---------------------------------------------------------------------------
+
+@app.route("/download-docx/<job_id>")
+def download_docx(job_id):
+    """Generate and download a .docx report mirroring the web results."""
+    if job_id not in jobs:
+        return "Job not found", 404
+
+    job = jobs[job_id]
+    results = job.get("results", [])
+    if not results:
+        results = job.get("citations", [])
+    quote_results = job.get("quote_results", [])
+    ai_score = job.get("ai_score", {})
+    human_error = job.get("human_error", {})
+
+    from docx import Document as DocxDocument
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    import datetime
+
+    doc = DocxDocument()
+
+    # --- Helper: set cell text with optional formatting ---
+    def set_cell(cell, text, bold=False, size=9, color=None):
+        cell.text = ""
+        p = cell.paragraphs[0]
+        run = p.add_run(str(text) if text else "")
+        run.bold = bold
+        run.font.size = Pt(size)
+        if color:
+            run.font.color.rgb = RGBColor(*color)
+
+    def add_table_borders(table):
+        """Add borders to all cells in a table via XML."""
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        tbl = table._tbl
+        tblPr = tbl.tblPr if tbl.tblPr is not None else OxmlElement("w:tblPr")
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            el = OxmlElement(f"w:{edge}")
+            el.set(qn("w:val"), "single")
+            el.set(qn("w:sz"), "4")
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), "999999")
+            borders.append(el)
+        tblPr.append(borders)
+
+    # ================================================================
+    # TITLE
+    # ================================================================
+    title = doc.add_heading("Citation Verification Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    date_para = doc.add_paragraph()
+    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = date_para.add_run(
+        f"Generated {datetime.datetime.now().strftime('%B %d, %Y at %I:%M %p')}"
+    )
+    run.font.size = Pt(10)
+    run.font.color.rgb = RGBColor(99, 110, 114)
+
+    # ================================================================
+    # SECTION 1: Citation Verification
+    # ================================================================
+    doc.add_heading("Citation Verification", level=1)
+
+    status_labels = {
+        "verified": "Verified",
+        "mismatch": "Name Mismatch",
+        "not_found": "Not Found",
+        "unrecognized": "Unknown Reporter",
+        "error": "Error",
+    }
+    status_colors = {
+        "verified": (21, 87, 36),       # green
+        "mismatch": (133, 100, 4),      # yellow/amber
+        "not_found": (114, 28, 36),     # red
+        "unrecognized": (56, 61, 65),   # gray
+        "error": (114, 28, 36),         # red
+    }
+
+    # Citation table
+    cite_table = doc.add_table(rows=1, cols=6)
+    cite_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    add_table_borders(cite_table)
+
+    headers = ["#", "Citation", "Parties", "Court & Year", "Status", "Detail"]
+    for i, h in enumerate(headers):
+        set_cell(cite_table.rows[0].cells[i], h, bold=True, size=9)
+
+    for idx, cite in enumerate(results, 1):
+        row = cite_table.add_row()
+        set_cell(row.cells[0], str(idx), size=9)
+        set_cell(row.cells[1], f"{cite.volume} {cite.reporter} {cite.page}", size=9)
+        set_cell(row.cells[2], cite.parties, size=9)
+        court_year = f"{cite.court} {cite.year}".strip()
+        set_cell(row.cells[3], f"({court_year})" if court_year else "", size=9)
+        status_text = status_labels.get(cite.status, cite.status)
+        status_color = status_colors.get(cite.status, (0, 0, 0))
+        set_cell(row.cells[4], status_text, bold=True, size=9, color=status_color)
+        detail = cite.detail or ""
+        if getattr(cite, "suggestion", ""):
+            if "Did you mean" not in detail:
+                detail += f" Did you mean: {cite.suggestion}?"
+        set_cell(row.cells[5], detail, size=8)
+
+    # Set column widths
+    for row in cite_table.rows:
+        row.cells[0].width = Inches(0.3)
+        row.cells[1].width = Inches(1.3)
+        row.cells[2].width = Inches(1.8)
+        row.cells[3].width = Inches(0.9)
+        row.cells[4].width = Inches(0.9)
+        row.cells[5].width = Inches(2.3)
+
+    # ================================================================
+    # SECTION 2: Summary Stats
+    # ================================================================
+    doc.add_paragraph()  # spacer
+    verified = sum(1 for c in results if c.status == "verified")
+    not_found = sum(1 for c in results if c.status == "not_found")
+    mismatch = sum(1 for c in results if c.status == "mismatch")
+    total = len(results)
+
+    summary_para = doc.add_paragraph()
+    summary_para.add_run("Summary:  ").bold = True
+    summary_para.add_run(f"Verified: {verified}  |  Not Found: {not_found}  "
+                         f"|  Mismatch: {mismatch}  |  Total: {total}")
+
+    suspicious = not_found + mismatch
+    if suspicious > 0:
+        warn_para = doc.add_paragraph()
+        warn_run = warn_para.add_run(
+            f"\u26a0 WARNING: {suspicious} citation(s) could not be verified "
+            f"and may be AI-generated."
+        )
+        warn_run.bold = True
+        warn_run.font.color.rgb = RGBColor(114, 28, 36)
+
+    # ================================================================
+    # SECTION 3: AI Detection Score
+    # ================================================================
+    if ai_score:
+        doc.add_heading("AI Detection Analysis", level=1)
+
+        score_val = ai_score.get("total_score", 0)
+        label = ai_score.get("label", "")
+        auto_flagged = ai_score.get("auto_flagged", False)
+
+        # Score display
+        score_para = doc.add_paragraph()
+        score_run = score_para.add_run(f"Score: {score_val} / 100")
+        score_run.bold = True
+        score_run.font.size = Pt(16)
+        if score_val <= 10:
+            score_run.font.color.rgb = RGBColor(21, 87, 36)
+        elif score_val <= 30:
+            score_run.font.color.rgb = RGBColor(133, 100, 4)
+        elif score_val <= 50:
+            score_run.font.color.rgb = RGBColor(230, 126, 34)
+        else:
+            score_run.font.color.rgb = RGBColor(192, 57, 43)
+
+        label_para = doc.add_paragraph()
+        label_run = label_para.add_run(label)
+        label_run.font.size = Pt(12)
+        label_run.italic = True
+
+        if auto_flagged:
+            flag_para = doc.add_paragraph()
+            flag_run = flag_para.add_run(
+                "\u26a0 FLAGGED: Fabricated case citations detected \u2014 "
+                "this brief is presumed AI-generated"
+            )
+            flag_run.bold = True
+            flag_run.font.color.rgb = RGBColor(192, 57, 43)
+
+        # Criteria table
+        criteria = ai_score.get("criteria", [])
+        if criteria:
+            doc.add_paragraph()  # spacer
+            crit_table = doc.add_table(rows=1, cols=3)
+            crit_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            add_table_borders(crit_table)
+
+            for i, h in enumerate(["Criterion", "Points", "Finding"]):
+                set_cell(crit_table.rows[0].cells[i], h, bold=True, size=9)
+
+            for c in criteria:
+                row = crit_table.add_row()
+                name_desc = f"{c.get('name', '')}\n{c.get('description', '')}"
+                set_cell(row.cells[0], name_desc, size=8)
+                pts_text = f"{c.get('points', 0)} / {c.get('max', 0)}"
+                pts_color = None
+                if c.get("points", 0) == 0:
+                    pts_color = (99, 110, 114)  # gray
+                elif c.get("points", 0) >= c.get("max", 0):
+                    pts_color = (192, 57, 43)   # red
+                else:
+                    pts_color = (230, 126, 34)  # orange
+                set_cell(row.cells[1], pts_text, bold=True, size=9, color=pts_color)
+                set_cell(row.cells[2], c.get("detail", ""), size=8)
+
+            for row in crit_table.rows:
+                row.cells[0].width = Inches(2.5)
+                row.cells[1].width = Inches(0.8)
+                row.cells[2].width = Inches(4.2)
+
+        # Methodology
+        doc.add_paragraph()
+        meth_para = doc.add_paragraph()
+        meth_run = meth_para.add_run(
+            "How this score is calculated: The score is the sum of points across "
+            "13 criteria that indicate potential AI generation. Each criterion has a "
+            "maximum point value based on its significance as an AI indicator. Higher "
+            "total scores indicate greater likelihood that the brief was AI-generated. "
+            "The presence of fabricated (non-existent) case citations automatically "
+            "flags the brief as AI-generated regardless of the total score. A score of "
+            "0 means no AI indicators were detected."
+        )
+        meth_run.font.size = Pt(8)
+        meth_run.italic = True
+        meth_run.font.color.rgb = RGBColor(99, 110, 114)
+
+    # ================================================================
+    # SECTION 4: Quotation Verification
+    # ================================================================
+    if quote_results:
+        doc.add_heading("Quotation Verification", level=1)
+
+        q_status_labels = {
+            "verified": "Verified",
+            "found_elsewhere": "Found Elsewhere",
+            "not_found": "Not Found",
+        }
+        q_status_colors = {
+            "verified": (21, 87, 36),
+            "found_elsewhere": (133, 100, 4),
+            "not_found": (114, 28, 36),
+        }
+
+        q_table = doc.add_table(rows=1, cols=5)
+        q_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        add_table_borders(q_table)
+
+        for i, h in enumerate(["#", "Quoted Text", "Attributed To", "Status", "Detail"]):
+            set_cell(q_table.rows[0].cells[i], h, bold=True, size=9)
+
+        for qi, q in enumerate(quote_results, 1):
+            row = q_table.add_row()
+            set_cell(row.cells[0], str(qi), size=9)
+            # Truncate quoted text
+            qtext = q.text[:200] + ("..." if len(q.text) > 200 else "")
+            set_cell(row.cells[1], qtext, size=8)
+            set_cell(row.cells[2], q.cite_label, size=9)
+            s_text = q_status_labels.get(q.status, q.status)
+            s_color = q_status_colors.get(q.status, (0, 0, 0))
+            set_cell(row.cells[3], s_text, bold=True, size=9, color=s_color)
+            set_cell(row.cells[4], q.detail or "", size=8)
+
+        for row in q_table.rows:
+            row.cells[0].width = Inches(0.3)
+            row.cells[1].width = Inches(2.8)
+            row.cells[2].width = Inches(1.2)
+            row.cells[3].width = Inches(1.0)
+            row.cells[4].width = Inches(2.2)
+
+    # ================================================================
+    # SECTION 5: Human Error Analysis
+    # ================================================================
+    he_items = human_error.get("items", [])
+    if he_items and ai_score:
+        doc.add_heading("Potential Human Error", level=1)
+
+        intro_para = doc.add_paragraph()
+        intro_run = intro_para.add_run(
+            "The following analysis re-examines flagged items to determine whether "
+            "they are more likely human mistakes (such as typos or misremembered "
+            "sources) or indicators of AI generation. The adjusted score accounts "
+            "for items that appear to be human error."
+        )
+        intro_run.font.size = Pt(9)
+        intro_run.italic = True
+
+        for item in he_items:
+            is_human = item.get("classification") == "human_error"
+            item_para = doc.add_paragraph()
+            # Classification label
+            cls_run = item_para.add_run(
+                "\u2713 Likely Human Error" if is_human else "\u26a0 AI Indicator"
+            )
+            cls_run.bold = True
+            cls_run.font.color.rgb = (
+                RGBColor(21, 87, 36) if is_human else RGBColor(192, 57, 43)
+            )
+            item_para.add_run("  \u2014  ")
+            desc_run = item_para.add_run(item.get("description", ""))
+            desc_run.font.size = Pt(9)
+            pts = item.get("points", 0)
+            pts_text = f" ({pts:+d} pts)" if pts != 0 else ""
+            pts_run = item_para.add_run(pts_text)
+            pts_run.bold = True
+            pts_run.font.size = Pt(9)
+
+        # Adjusted score summary
+        doc.add_paragraph()
+        base_score = ai_score.get("total_score", 0)
+        adjustment = human_error.get("adjustment", 0)
+        adjusted = max(0, min(100, base_score + adjustment))
+
+        adj_para = doc.add_paragraph()
+        adj_para.add_run(f"Base AI Score: {base_score}\n").bold = True
+        adj_para.add_run(f"Adjustment: {adjustment:+d}\n").bold = True
+
+        adj_score_run = adj_para.add_run(f"\nAdjusted AI Detection Score: {adjusted} / 100")
+        adj_score_run.bold = True
+        adj_score_run.font.size = Pt(14)
+        if adjusted <= 10:
+            adj_score_run.font.color.rgb = RGBColor(21, 87, 36)
+        elif adjusted <= 30:
+            adj_score_run.font.color.rgb = RGBColor(133, 100, 4)
+        elif adjusted <= 50:
+            adj_score_run.font.color.rgb = RGBColor(230, 126, 34)
+        else:
+            adj_score_run.font.color.rgb = RGBColor(192, 57, 43)
+
+        # Adjusted label
+        if adjusted == 0:
+            adj_label = "Not AI generated"
+        elif adjusted <= 10:
+            adj_label = "Low chance of AI generation"
+        elif adjusted <= 30:
+            adj_label = "Moderate chance of some AI generation"
+        elif adjusted <= 50:
+            adj_label = "High chance of some AI generation"
+        elif adjusted <= 80:
+            adj_label = "Moderate chance that entire brief was AI generated"
+        else:
+            adj_label = "High chance that entire brief was AI generated"
+
+        label_para = doc.add_paragraph()
+        label_run = label_para.add_run(adj_label)
+        label_run.italic = True
+        label_run.font.size = Pt(11)
+
+    # ================================================================
+    # FOOTER
+    # ================================================================
+    doc.add_paragraph()
+    footer_para = doc.add_paragraph()
+    footer_run = footer_para.add_run(
+        "Generated by AI Brief Detection Tool  \u2014  "
+        "For questions, contact bronsonr@flcourts.org"
+    )
+    footer_run.font.size = Pt(8)
+    footer_run.font.color.rgb = RGBColor(99, 110, 114)
+    footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Save to buffer
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+
+    # Privacy: remove job data after download
+    jobs.pop(job_id, None)
+
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        as_attachment=True,
+        download_name="citation_report.docx",
     )
 
 
