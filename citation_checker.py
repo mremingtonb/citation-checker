@@ -48,6 +48,18 @@ class Citation:
     status: str = "pending"  # verified, mismatch, not_found, unrecognized, error
     matched_case_name: str = ""
     detail: str = ""
+    suggestion: str = ""  # "Did you mean?" suggested correct citation
+
+
+@dataclass
+class Quote:
+    """A quoted passage attributed to a cited case."""
+    text: str                  # The quoted text
+    cite_index: int            # Index into citations list
+    cite_label: str            # e.g., "123 So. 2d 456"
+    status: str = "pending"    # pending / verified / not_in_case / found_elsewhere / not_found
+    found_in: str = ""         # Case name where actually found (if misattributed)
+    detail: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +330,108 @@ SEARCH_URL = f"{API_BASE}/search/"
 # Throttle: stay under 60 citations per minute
 REQUEST_DELAY = 1.1  # seconds between requests
 
+# Simple regex to parse citation strings returned by CourtListener search
+# e.g., "123 So. 2d 456" → volume=123, reporter="So. 2d", page=456
+CITE_STRING_RE = re.compile(
+    r"(\d{1,4})\s+(" + REPORTER_PATTERN + r")\s+(\d{1,5})"
+)
+
+
+def _edit_distance(s1: str, s2: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if len(s1) < len(s2):
+        return _edit_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def _normalize_reporter(r: str) -> str:
+    """Normalize a reporter abbreviation for comparison.
+    Strips spaces around periods: 'So. 2d' → 'So.2d'
+    """
+    return re.sub(r"\s+", "", r).lower()
+
+
+def _suggest_correction(
+    citation: Citation, session: requests.Session
+) -> str | None:
+    """Search CourtListener by case name to suggest a corrected citation.
+
+    When a citation is not found, this searches by party names to find the
+    actual case, then checks if any of its real citations are close to the
+    mistyped one (same reporter, edit distance ≤ 2 on volume/page).
+    Returns the suggested citation string, or None.
+    """
+    if not citation.parties or len(citation.parties.strip()) < 3:
+        return None
+
+    # Rate-limit before the extra API call
+    time.sleep(REQUEST_DELAY)
+
+    # Build search query from party names
+    parties_clean = re.sub(r"[^\w\s]", " ", citation.parties).strip()
+    # Truncate long names
+    if len(parties_clean) > 80:
+        parties_clean = parties_clean[:80]
+
+    try:
+        resp = session.get(
+            SEARCH_URL,
+            params={"q": f'caseName:("{parties_clean}")', "type": "o"},
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+
+    results = data.get("results", [])
+    if not results:
+        return None
+
+    our_reporter_norm = _normalize_reporter(citation.reporter)
+    best_suggestion = None
+    best_distance = 999
+
+    for result in results[:10]:  # Check top 10 results
+        cite_strings = result.get("citation", [])
+        if not cite_strings:
+            continue
+        for cite_str in cite_strings:
+            m = CITE_STRING_RE.search(cite_str)
+            if not m:
+                continue
+            vol, rptr, page = m.group(1), m.group(2), m.group(3)
+            if _normalize_reporter(rptr) != our_reporter_norm:
+                continue
+            # Same reporter — check if volume/page are close
+            vol_dist = _edit_distance(citation.volume, vol)
+            page_dist = _edit_distance(citation.page, page)
+            total_dist = vol_dist + page_dist
+            # Must be different but close (edit distance 1-3 on combined vol+page)
+            if 0 < total_dist <= 3 and total_dist < best_distance:
+                best_distance = total_dist
+                best_suggestion = f"{vol} {rptr} {page}"
+
+    return best_suggestion
+
 
 def verify_citation(citation: Citation, session: requests.Session) -> Citation:
     """Verify a single citation against the CourtListener API."""
@@ -411,6 +525,13 @@ def verify_citation(citation: Citation, session: requests.Session) -> Citation:
     else:
         citation.status = "verified"
         citation.detail = "Citation found (no case name to cross-check)"
+
+    # --- Step 3: "Did you mean?" suggestion for not-found citations ---
+    if citation.status == "not_found":
+        suggestion = _suggest_correction(citation, session)
+        if suggestion:
+            citation.suggestion = suggestion
+            citation.detail += f' Did you mean: {suggestion}?'
 
     return citation
 
@@ -1609,6 +1730,294 @@ def compute_ai_score(
         "auto_flagged": auto_flagged,
         "label": label,
         "criteria": criteria,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Quotation extraction & verification
+# ---------------------------------------------------------------------------
+
+# Pattern for quoted text: straight quotes, curly quotes
+_QUOTE_RE = re.compile(
+    r'(?:'
+    r'[\u201c](.+?)[\u201d]'   # curly quotes "..."
+    r'|'
+    r'"([^"]{40,}?)"'          # straight quotes "..."
+    r')',
+    re.DOTALL,
+)
+
+# Pattern for Id. / Ibid. references
+_ID_RE = re.compile(r'\bId\.\s*(?:at\s+\d+)?', re.IGNORECASE)
+
+
+def extract_quotes(text: str, citations: list) -> list:
+    """Extract substantial quoted passages and attribute them to citations.
+
+    Finds quoted text ≥ 40 characters and links each to the nearest citation
+    (looking within ~300 chars after the quote, falling back to nearest before).
+    Handles Id./Ibid. references by tracking the last-cited case.
+    """
+    if not citations:
+        return []
+
+    # Build a list of (position, citation_index) for all citations in the text
+    cite_positions = []
+    for i, cite in enumerate(citations):
+        # Search for the volume+reporter+page pattern in the text
+        pattern = re.escape(f"{cite.volume}") + r"\s+" + re.escape(cite.reporter) + r"\s+" + re.escape(f"{cite.page}")
+        for m in re.finditer(pattern, text):
+            cite_positions.append((m.start(), i))
+
+    cite_positions.sort(key=lambda x: x[0])
+
+    quotes = []
+    last_cite_index = 0  # Track last-used citation for Id. references
+
+    for m in _QUOTE_RE.finditer(text):
+        quoted_text = m.group(1) or m.group(2)
+        if not quoted_text or len(quoted_text.strip()) < 40:
+            continue
+
+        # Clean up the quoted text
+        quoted_text = quoted_text.strip()
+        quote_end = m.end()
+        quote_start = m.start()
+
+        # Look for a citation within ~300 chars after the closing quote
+        after_text = text[quote_end:quote_end + 300]
+        attributed_index = None
+
+        # Check for Id. / Ibid. reference first
+        id_match = _ID_RE.search(after_text[:80])
+        if id_match:
+            attributed_index = last_cite_index
+        else:
+            # Look for nearest citation after the quote
+            for pos, idx in cite_positions:
+                if pos >= quote_end and pos <= quote_end + 300:
+                    attributed_index = idx
+                    last_cite_index = idx
+                    break
+
+        # Fall back to nearest citation before the quote
+        if attributed_index is None:
+            for pos, idx in reversed(cite_positions):
+                if pos <= quote_start:
+                    attributed_index = idx
+                    last_cite_index = idx
+                    break
+
+        if attributed_index is None:
+            continue  # Can't attribute this quote
+
+        cite = citations[attributed_index]
+        cite_label = f"{cite.volume} {cite.reporter} {cite.page}"
+
+        quotes.append(Quote(
+            text=quoted_text[:500],  # Truncate very long quotes
+            cite_index=attributed_index,
+            cite_label=cite_label,
+        ))
+
+    return quotes
+
+
+def verify_quote(
+    quote: Quote, citation: Citation, session: requests.Session
+) -> Quote:
+    """Verify a quoted passage against CourtListener and Google Scholar.
+
+    Step 1: Search CourtListener for the exact phrase.
+    Step 2: Check if found in the cited case or elsewhere.
+    Step 3: If not in CourtListener, try Google Scholar.
+    """
+    # Use first ~12 words of the quote for the search
+    words = quote.text.split()
+    search_phrase = " ".join(words[:12])
+
+    # --- Step 1: Search CourtListener ---
+    time.sleep(REQUEST_DELAY)
+    try:
+        resp = session.get(
+            SEARCH_URL,
+            params={"q": f'"{search_phrase}"', "type": "o"},
+            timeout=30,
+        )
+    except requests.RequestException:
+        quote.status = "not_found"
+        quote.detail = "Search request failed"
+        return quote
+
+    if resp.status_code != 200:
+        quote.status = "not_found"
+        quote.detail = f"Search returned HTTP {resp.status_code}"
+        return quote
+
+    try:
+        data = resp.json()
+    except ValueError:
+        quote.status = "not_found"
+        quote.detail = "Invalid search response"
+        return quote
+
+    results = data.get("results", [])
+
+    if results:
+        # Check if any result matches the cited citation
+        our_cite_norm = _normalize_reporter(citation.reporter)
+        for result in results[:10]:
+            case_name = result.get("caseName", "") or ""
+            cite_strings = result.get("citation", [])
+            for cite_str in cite_strings:
+                m = CITE_STRING_RE.search(cite_str)
+                if not m:
+                    continue
+                vol, rptr, page = m.group(1), m.group(2), m.group(3)
+                if (vol == citation.volume
+                        and _normalize_reporter(rptr) == our_cite_norm
+                        and page == citation.page):
+                    # Found in the cited case!
+                    quote.status = "verified"
+                    quote.detail = f'Quote verified in {case_name}'
+                    return quote
+
+        # Found in CourtListener but NOT in the cited case
+        first_result = results[0]
+        found_name = first_result.get("caseName", "unknown case")
+        found_cites = first_result.get("citation", [])
+        found_cite_str = found_cites[0] if found_cites else ""
+        quote.status = "found_elsewhere"
+        quote.found_in = found_name
+        quote.detail = (
+            f'Quote not found in cited case. '
+            f'Found in: {found_name}'
+            + (f' ({found_cite_str})' if found_cite_str else '')
+        )
+        return quote
+
+    # --- Step 2: Try Google Scholar as fallback ---
+    try:
+        scholar_result = _search_google_scholar(search_phrase)
+        if scholar_result:
+            quote.status = "found_elsewhere"
+            quote.found_in = scholar_result
+            quote.detail = f'Not in CourtListener. Found via Google Scholar in: {scholar_result}'
+            return quote
+    except Exception:
+        pass  # Scholar search is best-effort
+
+    quote.status = "not_found"
+    quote.detail = "Quote not found in any legal database — may be fabricated"
+    return quote
+
+
+def _search_google_scholar(phrase: str) -> str | None:
+    """Search Google Scholar case law for an exact phrase.
+
+    Returns the case name if found, or None.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+
+    url = "https://scholar.google.com/scholar"
+    params = {
+        "q": f'"{phrase}"',
+        "hl": "en",
+        "as_sdt": "2006",  # Case law only
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Google Scholar results have class "gs_ri" for result info
+        results = soup.select(".gs_ri .gs_rt")
+        if results:
+            # Extract the first result title (case name)
+            case_name = results[0].get_text(strip=True)
+            # Clean up — remove [PDF] [HTML] prefixes
+            case_name = re.sub(r"^\[(?:PDF|HTML|BOOK)\]\s*", "", case_name)
+            return case_name if case_name else None
+    except Exception:
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Human error adjustment
+# ---------------------------------------------------------------------------
+
+def compute_human_error_adjustment(
+    citations: list, quotes: list
+) -> dict:
+    """Analyze flagged items to distinguish human error from AI fabrication.
+
+    Returns a dict with:
+      - adjustment: net point change (negative = likely human error)
+      - items: list of {description, classification, points} dicts
+      - Each item is either 'human_error' or 'ai_indicator'
+    """
+    items = []
+
+    # Check citations: not_found WITH suggestion = likely typo (human error)
+    for cite in (citations or []):
+        if cite.status == "not_found" and cite.suggestion:
+            items.append({
+                "description": (
+                    f"Citation {cite.volume} {cite.reporter} {cite.page} not found — "
+                    f"Did you mean {cite.suggestion}?"
+                ),
+                "classification": "human_error",
+                "points": -10,
+            })
+        elif cite.status == "not_found" and not cite.suggestion:
+            items.append({
+                "description": (
+                    f"Citation {cite.volume} {cite.reporter} {cite.page} not found — "
+                    f"no similar case exists"
+                ),
+                "classification": "ai_indicator",
+                "points": 0,  # Already scored by criterion #2
+            })
+
+    # Check quotes
+    for q in (quotes or []):
+        if q.status == "found_elsewhere":
+            items.append({
+                "description": (
+                    f'Quote attributed to {q.cite_label} was actually found in: '
+                    f'{q.found_in}'
+                ),
+                "classification": "human_error",
+                "points": -5,
+            })
+        elif q.status == "not_found":
+            items.append({
+                "description": (
+                    f'Quote attributed to {q.cite_label} was not found '
+                    f'in any legal database'
+                ),
+                "classification": "ai_indicator",
+                "points": 5,
+            })
+
+    adjustment = sum(item["points"] for item in items)
+
+    return {
+        "adjustment": adjustment,
+        "items": items,
     }
 
 

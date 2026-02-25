@@ -32,12 +32,17 @@ except ImportError:
 # Import core logic from the CLI script
 from citation_checker import (
     Citation,
+    Quote,
     extract_text,
     extract_citations,
+    extract_quotes,
     verify_citation,
+    verify_quote,
     REQUEST_DELAY,
     compute_ai_score,
+    compute_human_error_adjustment,
 )
+from dataclasses import asdict as _asdict
 import requests as http_requests
 
 app = Flask(__name__)
@@ -480,6 +485,115 @@ HTML_PAGE = """<!DOCTYPE html>
     text-align: center;
   }
 
+  /* Quote verification table */
+  .quote-section {
+    display: none;
+    margin-top: 1.5rem;
+  }
+
+  .quote-section h2 {
+    font-size: 1.2rem;
+    margin-bottom: 1rem;
+  }
+
+  .quote-text-cell {
+    max-width: 350px;
+    font-size: 0.8rem;
+    color: #2d3436;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+  }
+
+  .quote-text-cell.expanded {
+    white-space: normal;
+    overflow: visible;
+  }
+
+  .badge-verified       { background: #d4edda; color: #155724; }
+  .badge-found_elsewhere { background: #fff3cd; color: #856404; }
+  .badge-not_in_case    { background: #ffe0b2; color: #e65100; }
+
+  /* Human Error Section */
+  .human-error-section {
+    display: none;
+    margin-top: 1.5rem;
+    background: #fff;
+    border-radius: 12px;
+    padding: 2rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  .human-error-section h3 {
+    font-size: 1.2rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .human-error-intro {
+    font-size: 0.88rem;
+    color: #636e72;
+    margin-bottom: 1rem;
+    line-height: 1.5;
+  }
+
+  .he-item {
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    margin-bottom: 0.5rem;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+  }
+
+  .he-item-human {
+    background: #d4edda;
+    border: 1px solid #c3e6cb;
+    color: #155724;
+  }
+
+  .he-item-ai {
+    background: #f8d7da;
+    border: 1px solid #f5c6cb;
+    color: #721c24;
+  }
+
+  .he-classification {
+    font-weight: 700;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .he-points {
+    font-weight: 700;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .adjusted-score-box {
+    margin-top: 1.5rem;
+    text-align: center;
+    padding: 1.5rem;
+    background: #f8f9fa;
+    border-radius: 8px;
+  }
+
+  .adjusted-score-number {
+    font-size: 3rem;
+    font-weight: 800;
+    line-height: 1;
+  }
+
+  .adjusted-score-label {
+    font-size: 0.95rem;
+    color: #636e72;
+    margin-top: 0.5rem;
+  }
+
   .site-footer {
     margin-top: 1.5rem;
     padding: 1.5rem 0;
@@ -521,6 +635,12 @@ HTML_PAGE = """<!DOCTYPE html>
     conclusion yourself. Similarly, an indication that a brief is not AI generated does not mean
     that it does not, in fact, contain AI generated content. Always rely on your intuition if
     something seems off.
+  </div>
+
+  <div class="disclaimer-box">
+    <strong>&#9888; Important:</strong> While this page immediately deletes anything uploaded,
+    NEVER upload original court product and NEVER upload a brief that is not already available
+    to the public.
   </div>
 
   <!-- Options -->
@@ -637,13 +757,48 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Quote Verification Results -->
+  <div class="quote-section" id="quoteSection">
+    <h2>Quotation Verification</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Quoted Text</th>
+          <th>Attributed To</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="quoteBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Potential Human Error Analysis -->
+  <div class="human-error-section" id="humanErrorSection">
+    <h3>Potential Human Error</h3>
+    <p class="human-error-intro">
+      The following analysis re-examines flagged items to determine whether they are more likely
+      human mistakes (such as typos or misremembered sources) or indicators of AI generation.
+      The adjusted score accounts for items that appear to be human error.
+    </p>
+    <div id="humanErrorItems"></div>
+    <div class="adjusted-score-box">
+      <div>Base AI Score: <strong id="heBaseScore">--</strong></div>
+      <div>Adjustment: <strong id="heAdjustment">--</strong></div>
+      <hr style="margin:0.75rem 0; border:none; border-top:1px solid #dfe6e9;">
+      <div class="adjusted-score-number" id="heAdjustedScore">--</div>
+      <div class="adjusted-score-label">Adjusted AI Detection Score</div>
+      <div class="score-label" id="heAdjustedLabel" style="margin-top:0.5rem;"></div>
+    </div>
+  </div>
+
   <div class="privacy-notice">
     &#128274; <strong>Privacy:</strong> Uploaded files are processed in real time and immediately deleted from the server.
     No documents, text, or citation data are stored after your analysis is complete.
   </div>
 
   <footer class="site-footer">
-    <p>If you have ideas for how the AI detector could be improved, including additional or reweighed AI generation factors, please contact the developer at <a href="mailto:Remington.Bronson@gmail.com">Remington.Bronson@gmail.com</a>.</p>
+    <p>If you have ideas for how the AI detector could be improved, including additional or reweighed AI generation factors, please contact the developer at <a href="mailto:bronsonr@flcourts.org">bronsonr@flcourts.org</a>.</p>
   </footer>
 </div>
 
@@ -723,6 +878,10 @@ function resetUI() {
   csvBtn.disabled = true;
   document.getElementById('aiScoreSection').style.display = 'none';
   document.getElementById('flaggedBanner').style.display = 'none';
+  document.getElementById('quoteSection').style.display = 'none';
+  document.getElementById('quoteBody').innerHTML = '';
+  document.getElementById('humanErrorSection').style.display = 'none';
+  document.getElementById('humanErrorItems').innerHTML = '';
 }
 
 async function startCheck() {
@@ -793,6 +952,8 @@ async function startCheck() {
 function startVerification(jobId, total) {
   const evtSource = new EventSource('/verify/' + jobId);
   let completed = 0;
+  let quoteTotal = 0;
+  let quotesCompleted = 0;
 
   const stats = { verified: 0, not_found: 0, mismatch: 0, unrecognized: 0, error: 0 };
 
@@ -808,9 +969,17 @@ function startVerification(jobId, total) {
       badge.className = 'badge badge-' + cite.status;
       badge.textContent = formatStatus(cite.status);
 
-      // Update detail
+      // Update detail — highlight "Did you mean" suggestions
       const detail = document.getElementById('detail-' + idx);
-      detail.textContent = cite.detail || '';
+      const detailText = cite.detail || '';
+      if (detailText.includes('Did you mean:')) {
+        const parts = detailText.split('Did you mean:');
+        detail.innerHTML = escHtml(parts[0]) +
+          '<em style="color:#0984e3;font-weight:600">Did you mean:' +
+          escHtml(parts[1]) + '</em>';
+      } else {
+        detail.textContent = detailText;
+      }
 
       // Track stats
       if (stats.hasOwnProperty(cite.status)) stats[cite.status]++;
@@ -819,6 +988,45 @@ function startVerification(jobId, total) {
       const pct = Math.round((completed / total) * 100);
       progressBar.style.width = pct + '%';
       progressText.textContent = `Verifying ${completed} / ${total} citations...`;
+    }
+
+    if (data.type === 'quote_phase') {
+      quoteTotal = data.total;
+      if (quoteTotal > 0) {
+        document.getElementById('quoteSection').style.display = 'block';
+        progressText.textContent = `Verifying 0 / ${quoteTotal} quotations...`;
+        progressBar.style.width = '0%';
+      }
+    }
+
+    if (data.type === 'quote_result') {
+      const q = data.quote;
+      const qBody = document.getElementById('quoteBody');
+      const tr = document.createElement('tr');
+
+      const statusLabels = {
+        verified: 'Verified',
+        found_elsewhere: 'Found Elsewhere',
+        not_found: 'Not Found',
+        pending: 'Pending',
+      };
+
+      tr.innerHTML =
+        '<td>' + (data.index + 1) + '</td>' +
+        '<td class="quote-text-cell" onclick="this.classList.toggle(\'expanded\')" title="Click to expand">' +
+          escHtml(q.text.substring(0, 120)) + (q.text.length > 120 ? '...' : '') +
+        '</td>' +
+        '<td><span style="color:#636e72;font-size:0.85rem">' + escHtml(q.cite_label) + '</span></td>' +
+        '<td><span class="badge badge-' + q.status + '">' + (statusLabels[q.status] || q.status) + '</span>' +
+          '<div class="detail-text">' + escHtml(q.detail) + '</div></td>';
+      qBody.appendChild(tr);
+
+      quotesCompleted++;
+      if (quoteTotal > 0) {
+        const pct = Math.round((quotesCompleted / quoteTotal) * 100);
+        progressBar.style.width = pct + '%';
+        progressText.textContent = `Verifying ${quotesCompleted} / ${quoteTotal} quotations...`;
+      }
     }
 
     if (data.type === 'done') {
@@ -848,6 +1056,11 @@ function startVerification(jobId, total) {
       // Display AI detection score
       if (data.ai_score) {
         displayAiScore(data.ai_score);
+      }
+
+      // Display Human Error analysis
+      if (data.human_error && data.human_error.items && data.human_error.items.length > 0) {
+        displayHumanError(data.human_error, data.ai_score ? data.ai_score.total_score : 0);
       }
     }
   };
@@ -914,6 +1127,57 @@ function displayAiScore(aiScore) {
   section.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
+function displayHumanError(he, baseScore) {
+  const section = document.getElementById('humanErrorSection');
+  const itemsDiv = document.getElementById('humanErrorItems');
+  section.style.display = 'block';
+
+  itemsDiv.innerHTML = '';
+  he.items.forEach(function(item) {
+    const isHuman = item.classification === 'human_error';
+    const div = document.createElement('div');
+    div.className = 'he-item ' + (isHuman ? 'he-item-human' : 'he-item-ai');
+    const pointsText = item.points < 0 ? item.points + ' pts' : (item.points > 0 ? '+' + item.points + ' pts' : '—');
+    div.innerHTML =
+      '<div>' +
+        '<span class="he-classification">' + (isHuman ? '&#10003; Likely Human Error' : '&#9888; AI Indicator') + '</span><br>' +
+        escHtml(item.description) +
+      '</div>' +
+      '<div class="he-points">' + pointsText + '</div>';
+    itemsDiv.appendChild(div);
+  });
+
+  // Calculate adjusted score
+  const adjustment = he.adjustment;
+  const adjusted = Math.max(0, Math.min(100, baseScore + adjustment));
+
+  document.getElementById('heBaseScore').textContent = baseScore;
+  document.getElementById('heAdjustment').textContent = (adjustment >= 0 ? '+' : '') + adjustment;
+
+  const adjScoreEl = document.getElementById('heAdjustedScore');
+  adjScoreEl.textContent = adjusted;
+
+  let colorClass;
+  if (adjusted === 0) colorClass = 'score-green';
+  else if (adjusted <= 10) colorClass = 'score-green';
+  else if (adjusted <= 30) colorClass = 'score-yellow';
+  else if (adjusted <= 50) colorClass = 'score-orange';
+  else colorClass = 'score-red';
+  adjScoreEl.className = 'adjusted-score-number ' + colorClass;
+
+  // Adjusted label
+  const labelEl = document.getElementById('heAdjustedLabel');
+  let label;
+  if (adjusted === 0) label = 'Not AI generated';
+  else if (adjusted <= 10) label = 'Low chance of AI generation';
+  else if (adjusted <= 30) label = 'Moderate chance of some AI generation';
+  else if (adjusted <= 50) label = 'High chance of some AI generation';
+  else if (adjusted <= 80) label = 'Moderate chance that entire brief was AI generated';
+  else label = 'High chance that entire brief was AI generated';
+  labelEl.textContent = label;
+  labelEl.className = 'score-label ' + colorClass;
+}
+
 function escHtml(str) {
   const d = document.createElement('div');
   d.textContent = str || '';
@@ -967,11 +1231,16 @@ def upload():
     allow_other_state = request.form.get("allow_other_state") == "1"
     allow_federal = request.form.get("allow_federal") == "1"
 
+    # Extract quotes attributed to citations
+    quotes = extract_quotes(text, citations)
+
     # Create a job
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {
         "citations": citations,
         "results": [],
+        "quotes": quotes,
+        "quote_results": [],
         "text": text,
         "pro_se_manual": pro_se_manual,
         "allow_other_state": allow_other_state,
@@ -1042,7 +1311,47 @@ def verify(job_id):
             allow_other_state=job.get("allow_other_state", False),
             allow_federal=job.get("allow_federal", False),
         )
-        done_payload = {"type": "done", "ai_score": ai_result}
+
+        # --- Phase 2: Quotation verification ---
+        quotes = job.get("quotes", [])
+        if quotes:
+            quote_phase = json.dumps({"type": "quote_phase", "total": len(quotes)})
+            yield f"data: {quote_phase}\n\n"
+
+            for qi, quote in enumerate(quotes):
+                cite = citations[quote.cite_index] if quote.cite_index < len(citations) else None
+                if cite:
+                    verify_quote(quote, cite, session)
+                else:
+                    quote.status = "not_found"
+                    quote.detail = "Could not resolve attributed citation"
+                job["quote_results"].append(quote)
+
+                q_payload = json.dumps({
+                    "type": "quote_result",
+                    "index": qi,
+                    "quote": {
+                        "text": quote.text,
+                        "cite_index": quote.cite_index,
+                        "cite_label": quote.cite_label,
+                        "status": quote.status,
+                        "found_in": quote.found_in,
+                        "detail": quote.detail,
+                    },
+                })
+                yield f"data: {q_payload}\n\n"
+
+        # Compute human error adjustment
+        human_error = compute_human_error_adjustment(
+            list(job["results"]),
+            list(job.get("quote_results", [])),
+        )
+
+        done_payload = {
+            "type": "done",
+            "ai_score": ai_result,
+            "human_error": human_error,
+        }
         yield f"data: {json.dumps(done_payload)}\n\n"
 
         # Privacy: remove stored document text immediately after scoring
@@ -1070,9 +1379,11 @@ def download(job_id):
 
     output = io.StringIO()
     writer = csv.writer(output)
+
+    # Section 1: Citation verification
     writer.writerow([
         "Citation", "Parties", "Volume", "Reporter", "Page",
-        "Court", "Year", "Status", "Matched Case Name", "Detail",
+        "Court", "Year", "Status", "Matched Case Name", "Detail", "Suggestion",
     ])
     for cite in results:
         writer.writerow([
@@ -1086,7 +1397,26 @@ def download(job_id):
             cite.status,
             cite.matched_case_name,
             cite.detail,
+            getattr(cite, "suggestion", ""),
         ])
+
+    # Section 2: Quotation verification (if any)
+    quote_results = job.get("quote_results", [])
+    if quote_results:
+        writer.writerow([])  # Blank line separator
+        writer.writerow(["QUOTATION VERIFICATION"])
+        writer.writerow([
+            "Quoted Text (first 100 chars)", "Attributed Citation",
+            "Status", "Found In", "Detail",
+        ])
+        for q in quote_results:
+            writer.writerow([
+                q.text[:100] + ("..." if len(q.text) > 100 else ""),
+                q.cite_label,
+                q.status,
+                q.found_in,
+                q.detail,
+            ])
 
     buf = io.BytesIO(output.getvalue().encode("utf-8"))
     buf.seek(0)
