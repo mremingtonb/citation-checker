@@ -1,0 +1,38 @@
+# Environment variables — never commit this
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp / uploads
+*.tmp
+tmp/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# ngrok binary — no need to commit this
+ngrok.exe
+
+# Claude dev files
+.claude/

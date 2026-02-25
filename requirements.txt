@@ -1,0 +1,6 @@
+python-docx
+requests
+flask
+pymupdf
+python-dotenv
+gunicorn

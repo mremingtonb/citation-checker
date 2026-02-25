@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""
+Citation Checker — Web Application
+
+A Flask web app that lets users upload .docx legal briefs and verifies
+case law citations against the CourtListener API in real time.
+
+Usage:
+    python app.py
+    Then open http://localhost:5000
+"""
+
+import csv
+import io
+import json
+import os
+import tempfile
+import time
+import uuid
+
+from dataclasses import asdict
+from flask import Flask, request, jsonify, Response, send_file
+
+# Load .env file for local development (ignored in production)
+try:
+    from dotenv import load_dotenv
+    import pathlib
+    load_dotenv(pathlib.Path(__file__).parent / ".env", override=True)
+except ImportError:
+    pass
+
+# Import core logic from the CLI script
+from citation_checker import (
+    Citation,
+    extract_text,
+    extract_citations,
+    verify_citation,
+    REQUEST_DELAY,
+)
+import requests as http_requests
+
+app = Flask(__name__)
+
+# Store jobs in memory (fine for a single-server deployment)
+jobs: dict[str, dict] = {}
+
+COURTLISTENER_TOKEN = os.environ.get("COURTLISTENER_TOKEN", "")
+
+# ---------------------------------------------------------------------------
+# HTML Template (embedded to keep it a single file)
+# ---------------------------------------------------------------------------
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Citation Checker</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #f5f6fa;
+    color: #2d3436;
+    line-height: 1.6;
+  }
+
+  .container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 2rem;
+  }
+
+  header h1 {
+    font-size: 1.75rem;
+    font-weight: 700;
+    color: #1a1a2e;
+  }
+
+  header p {
+    color: #636e72;
+    margin-top: 0.25rem;
+    font-size: 0.95rem;
+  }
+
+  /* Upload area */
+  .upload-area {
+    border: 2px dashed #b2bec3;
+    border-radius: 12px;
+    padding: 3rem 2rem;
+    text-align: center;
+    background: #fff;
+    transition: border-color 0.2s, background 0.2s;
+    cursor: pointer;
+  }
+
+  .upload-area.dragover {
+    border-color: #0984e3;
+    background: #edf5ff;
+  }
+
+  .upload-area p {
+    font-size: 1.05rem;
+    color: #636e72;
+  }
+
+  .upload-area .icon {
+    font-size: 2.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .upload-area input[type="file"] { display: none; }
+
+  .btn {
+    display: inline-block;
+    padding: 0.6rem 1.5rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+    text-decoration: none;
+    color: #fff;
+  }
+
+  .btn-primary { background: #0984e3; }
+  .btn-primary:hover { background: #0770c2; }
+  .btn-secondary { background: #636e72; }
+  .btn-secondary:hover { background: #4a5459; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .upload-btn { margin-top: 1rem; }
+
+  /* Progress */
+  .progress-section {
+    display: none;
+    margin-top: 2rem;
+    background: #fff;
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  .progress-bar-outer {
+    width: 100%;
+    height: 8px;
+    background: #dfe6e9;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 0.75rem 0;
+  }
+
+  .progress-bar-inner {
+    height: 100%;
+    width: 0%;
+    background: #0984e3;
+    border-radius: 4px;
+    transition: width 0.3s ease;
+  }
+
+  .progress-text {
+    font-size: 0.9rem;
+    color: #636e72;
+  }
+
+  /* Results table */
+  .results-section {
+    display: none;
+    margin-top: 1.5rem;
+  }
+
+  .results-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+
+  .results-header h2 {
+    font-size: 1.2rem;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  th, td {
+    text-align: left;
+    padding: 0.75rem 1rem;
+    font-size: 0.9rem;
+  }
+
+  th {
+    background: #1a1a2e;
+    color: #fff;
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  tr:nth-child(even) td { background: #f8f9fa; }
+
+  tr:hover td { background: #edf5ff; }
+
+  .badge {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .badge-pending    { background: #dfe6e9; color: #636e72; }
+  .badge-verified   { background: #d4edda; color: #155724; }
+  .badge-mismatch   { background: #fff3cd; color: #856404; }
+  .badge-not_found  { background: #f8d7da; color: #721c24; }
+  .badge-unrecognized { background: #e2e3e5; color: #383d41; }
+  .badge-error      { background: #f8d7da; color: #721c24; }
+
+  .detail-text {
+    font-size: 0.8rem;
+    color: #636e72;
+    margin-top: 0.25rem;
+  }
+
+  /* Summary */
+  .summary {
+    display: none;
+    margin-top: 1.5rem;
+    background: #fff;
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  .summary h3 { margin-bottom: 0.75rem; font-size: 1.1rem; }
+
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0.75rem;
+  }
+
+  .stat-card {
+    text-align: center;
+    padding: 1rem;
+    border-radius: 8px;
+    background: #f8f9fa;
+  }
+
+  .stat-card .num {
+    font-size: 1.5rem;
+    font-weight: 700;
+  }
+
+  .stat-card .label {
+    font-size: 0.8rem;
+    color: #636e72;
+    text-transform: uppercase;
+  }
+
+  .stat-verified .num { color: #155724; }
+  .stat-not_found .num { color: #721c24; }
+  .stat-mismatch .num { color: #856404; }
+
+  .warning-banner {
+    display: none;
+    margin-top: 1rem;
+    padding: 1rem;
+    background: #f8d7da;
+    border: 1px solid #f5c6cb;
+    border-radius: 8px;
+    color: #721c24;
+    font-weight: 600;
+  }
+
+  /* Error message */
+  .error-msg {
+    display: none;
+    margin-top: 1rem;
+    padding: 1rem;
+    background: #f8d7da;
+    border: 1px solid #f5c6cb;
+    border-radius: 8px;
+    color: #721c24;
+  }
+
+  .filename-display {
+    margin-top: 0.75rem;
+    font-weight: 600;
+    color: #2d3436;
+  }
+
+  @media (max-width: 600px) {
+    .container { padding: 1rem; }
+    th, td { padding: 0.5rem; font-size: 0.8rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <h1>Citation Checker</h1>
+    <p>Upload a legal brief (.docx) to verify case law citations</p>
+  </header>
+
+  <!-- Upload -->
+  <div class="upload-area" id="uploadArea">
+    <div class="icon">&#128196;</div>
+    <p>Drag &amp; drop a .docx or .pdf file here, or click to browse</p>
+    <input type="file" id="fileInput" accept=".docx,.pdf">
+    <div class="filename-display" id="filenameDisplay"></div>
+    <button class="btn btn-primary upload-btn" id="uploadBtn" disabled>Check Citations</button>
+  </div>
+
+  <div class="error-msg" id="errorMsg"></div>
+
+  <!-- Progress -->
+  <div class="progress-section" id="progressSection">
+    <div class="progress-text" id="progressText">Extracting citations...</div>
+    <div class="progress-bar-outer">
+      <div class="progress-bar-inner" id="progressBar"></div>
+    </div>
+  </div>
+
+  <!-- Results -->
+  <div class="results-section" id="resultsSection">
+    <div class="results-header">
+      <h2>Citations Found</h2>
+      <button class="btn btn-secondary" id="csvBtn" disabled>Download CSV</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Citation</th>
+          <th>Court &amp; Year</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="resultsBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Summary -->
+  <div class="summary" id="summarySection">
+    <h3>Verification Summary</h3>
+    <div class="summary-grid">
+      <div class="stat-card stat-verified">
+        <div class="num" id="statVerified">0</div>
+        <div class="label">Verified</div>
+      </div>
+      <div class="stat-card stat-not_found">
+        <div class="num" id="statNotFound">0</div>
+        <div class="label">Not Found</div>
+      </div>
+      <div class="stat-card stat-mismatch">
+        <div class="num" id="statMismatch">0</div>
+        <div class="label">Mismatch</div>
+      </div>
+      <div class="stat-card">
+        <div class="num" id="statTotal">0</div>
+        <div class="label">Total</div>
+      </div>
+    </div>
+    <div class="warning-banner" id="warningBanner"></div>
+  </div>
+</div>
+
+<script>
+const uploadArea = document.getElementById('uploadArea');
+const fileInput = document.getElementById('fileInput');
+const uploadBtn = document.getElementById('uploadBtn');
+const filenameDisplay = document.getElementById('filenameDisplay');
+const errorMsg = document.getElementById('errorMsg');
+const progressSection = document.getElementById('progressSection');
+const progressText = document.getElementById('progressText');
+const progressBar = document.getElementById('progressBar');
+const resultsSection = document.getElementById('resultsSection');
+const resultsBody = document.getElementById('resultsBody');
+const csvBtn = document.getElementById('csvBtn');
+const summarySection = document.getElementById('summarySection');
+const warningBanner = document.getElementById('warningBanner');
+
+let selectedFile = null;
+let currentJobId = null;
+
+// Drag & drop
+uploadArea.addEventListener('click', (e) => {
+  if (e.target === uploadBtn) return;
+  fileInput.click();
+});
+
+uploadArea.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  uploadArea.classList.add('dragover');
+});
+
+uploadArea.addEventListener('dragleave', () => {
+  uploadArea.classList.remove('dragover');
+});
+
+uploadArea.addEventListener('drop', (e) => {
+  e.preventDefault();
+  uploadArea.classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (file) selectFile(file);
+});
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) selectFile(fileInput.files[0]);
+});
+
+function selectFile(file) {
+  const name = file.name.toLowerCase();
+  if (!name.endsWith('.docx') && !name.endsWith('.pdf')) {
+    showError('Please select a .docx or .pdf file.');
+    return;
+  }
+  selectedFile = file;
+  filenameDisplay.textContent = file.name;
+  uploadBtn.disabled = false;
+  hideError();
+}
+
+uploadBtn.addEventListener('click', startCheck);
+
+function showError(msg) {
+  errorMsg.textContent = msg;
+  errorMsg.style.display = 'block';
+}
+
+function hideError() {
+  errorMsg.style.display = 'none';
+}
+
+function resetUI() {
+  resultsBody.innerHTML = '';
+  resultsSection.style.display = 'none';
+  summarySection.style.display = 'none';
+  warningBanner.style.display = 'none';
+  progressBar.style.width = '0%';
+  csvBtn.disabled = true;
+}
+
+async function startCheck() {
+  if (!selectedFile) return;
+  hideError();
+  resetUI();
+  uploadBtn.disabled = true;
+
+  progressSection.style.display = 'block';
+  progressText.textContent = 'Uploading and extracting citations...';
+
+  const formData = new FormData();
+  formData.append('file', selectedFile);
+
+  try {
+    const resp = await fetch('/upload', { method: 'POST', body: formData });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      showError(data.error || 'Upload failed.');
+      progressSection.style.display = 'none';
+      uploadBtn.disabled = false;
+      return;
+    }
+
+    currentJobId = data.job_id;
+    const citations = data.citations;
+
+    if (citations.length === 0) {
+      progressSection.style.display = 'none';
+      showError('No case citations found in the document.');
+      uploadBtn.disabled = false;
+      return;
+    }
+
+    // Build results table
+    resultsSection.style.display = 'block';
+    citations.forEach((cite, i) => {
+      const tr = document.createElement('tr');
+      tr.id = 'row-' + i;
+      tr.innerHTML = `
+        <td>${i + 1}</td>
+        <td>
+          <strong>${escHtml(cite.parties)}</strong><br>
+          <span style="color:#636e72">${escHtml(cite.volume)} ${escHtml(cite.reporter)} ${escHtml(cite.page)}</span>
+          <div class="detail-text" id="detail-${i}"></div>
+        </td>
+        <td>${escHtml(cite.court)} ${escHtml(cite.year)}</td>
+        <td><span class="badge badge-pending" id="badge-${i}">Pending</span></td>
+      `;
+      resultsBody.appendChild(tr);
+    });
+
+    // Start SSE verification
+    progressText.textContent = `Verifying 0 / ${citations.length} citations...`;
+    startVerification(currentJobId, citations.length);
+
+  } catch (err) {
+    showError('Network error: ' + err.message);
+    progressSection.style.display = 'none';
+    uploadBtn.disabled = false;
+  }
+}
+
+function startVerification(jobId, total) {
+  const evtSource = new EventSource('/verify/' + jobId);
+  let completed = 0;
+
+  const stats = { verified: 0, not_found: 0, mismatch: 0, unrecognized: 0, error: 0 };
+
+  evtSource.onmessage = function(event) {
+    const data = JSON.parse(event.data);
+
+    if (data.type === 'result') {
+      const idx = data.index;
+      const cite = data.citation;
+
+      // Update badge
+      const badge = document.getElementById('badge-' + idx);
+      badge.className = 'badge badge-' + cite.status;
+      badge.textContent = formatStatus(cite.status);
+
+      // Update detail
+      const detail = document.getElementById('detail-' + idx);
+      detail.textContent = cite.detail || '';
+
+      // Track stats
+      if (stats.hasOwnProperty(cite.status)) stats[cite.status]++;
+
+      completed++;
+      const pct = Math.round((completed / total) * 100);
+      progressBar.style.width = pct + '%';
+      progressText.textContent = `Verifying ${completed} / ${total} citations...`;
+    }
+
+    if (data.type === 'done') {
+      evtSource.close();
+      progressText.textContent = 'Verification complete.';
+      uploadBtn.disabled = false;
+
+      // Show summary
+      document.getElementById('statVerified').textContent = stats.verified;
+      document.getElementById('statNotFound').textContent = stats.not_found;
+      document.getElementById('statMismatch').textContent = stats.mismatch;
+      document.getElementById('statTotal').textContent = total;
+      summarySection.style.display = 'block';
+
+      const suspicious = stats.not_found + stats.mismatch;
+      if (suspicious > 0) {
+        warningBanner.textContent = suspicious + ' citation(s) could not be verified and may be AI-generated.';
+        warningBanner.style.display = 'block';
+      }
+
+      // Enable CSV download
+      csvBtn.disabled = false;
+      csvBtn.onclick = () => {
+        window.location.href = '/download/' + jobId;
+      };
+    }
+  };
+
+  evtSource.onerror = function() {
+    evtSource.close();
+    progressText.textContent = 'Connection lost. Partial results shown above.';
+    uploadBtn.disabled = false;
+  };
+}
+
+function formatStatus(s) {
+  const labels = {
+    verified: 'Verified',
+    mismatch: 'Name Mismatch',
+    not_found: 'Not Found',
+    unrecognized: 'Unknown Reporter',
+    error: 'Error',
+    pending: 'Pending',
+  };
+  return labels[s] || s;
+}
+
+function escHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str || '';
+  return d.innerHTML;
+}
+</script>
+
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    return HTML_PAGE
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded."}), 400
+
+    file = request.files["file"]
+    fname = file.filename.lower()
+    if not (fname.endswith(".docx") or fname.endswith(".pdf")):
+        return jsonify({"error": "Please upload a .docx or .pdf file."}), 400
+
+    suffix = ".pdf" if fname.endswith(".pdf") else ".docx"
+    # Save to temp file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        file.save(tmp.name)
+        tmp.close()
+
+        # Extract text and parse citations
+        text = extract_text(tmp.name)
+        citations = extract_citations(text)
+    except Exception as e:
+        return jsonify({"error": f"Failed to process file: {e}"}), 500
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    # Create a job
+    job_id = uuid.uuid4().hex[:12]
+    jobs[job_id] = {
+        "citations": citations,
+        "results": [],
+    }
+
+    # Return the extracted citations (without verification yet)
+    return jsonify({
+        "job_id": job_id,
+        "citations": [
+            {
+                "parties": c.parties,
+                "volume": c.volume,
+                "reporter": c.reporter,
+                "page": c.page,
+                "court": c.court,
+                "year": c.year,
+            }
+            for c in citations
+        ],
+    })
+
+
+@app.route("/verify/<job_id>")
+def verify(job_id):
+    if job_id not in jobs:
+        return "Job not found", 404
+
+    def generate():
+        job = jobs[job_id]
+        citations = job["citations"]
+
+        session = http_requests.Session()
+        session.headers.update({
+            "Authorization": f"Token {COURTLISTENER_TOKEN}",
+        })
+
+        for i, cite in enumerate(citations):
+            verify_citation(cite, session)
+            job["results"].append(cite)
+
+            payload = json.dumps({
+                "type": "result",
+                "index": i,
+                "citation": {
+                    "parties": cite.parties,
+                    "volume": cite.volume,
+                    "reporter": cite.reporter,
+                    "page": cite.page,
+                    "court": cite.court,
+                    "year": cite.year,
+                    "status": cite.status,
+                    "matched_case_name": cite.matched_case_name,
+                    "detail": cite.detail,
+                },
+            })
+            yield f"data: {payload}\n\n"
+
+            # Rate limiting between requests
+            if i < len(citations) - 1:
+                time.sleep(REQUEST_DELAY)
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/download/<job_id>")
+def download(job_id):
+    if job_id not in jobs:
+        return "Job not found", 404
+
+    job = jobs[job_id]
+    results = job.get("results", [])
+    if not results:
+        results = job["citations"]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Citation", "Parties", "Volume", "Reporter", "Page",
+        "Court", "Year", "Status", "Matched Case Name", "Detail",
+    ])
+    for cite in results:
+        writer.writerow([
+            f"{cite.volume} {cite.reporter} {cite.page}",
+            cite.parties,
+            cite.volume,
+            cite.reporter,
+            cite.page,
+            cite.court,
+            cite.year,
+            cite.status,
+            cite.matched_case_name,
+            cite.detail,
+        ])
+
+    buf = io.BytesIO(output.getvalue().encode("utf-8"))
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="citation_results.csv",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_ENV") != "production"
+    print("\n  Citation Checker Web App")
+    print(f"  Open http://localhost:{port} in your browser\n")
+    app.run(debug=debug, host="0.0.0.0", port=port, threaded=True)
