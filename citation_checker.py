@@ -479,6 +479,74 @@ def _citations_are_similar(
     return total_dist <= 3
 
 
+def _suggest_correction_google_scholar(citation: Citation) -> str | None:
+    """Search Google Scholar by case name to suggest a corrected citation.
+
+    Fallback for when CourtListener doesn't have the case at all.
+    Searches Scholar for the party names, then checks if any result has
+    a citation with the same reporter and close volume/page numbers.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+
+    if not citation.parties or len(citation.parties.strip()) < 3:
+        return None
+
+    # Build search query: case name + reporter to narrow results
+    query = f'{citation.parties} {citation.reporter}'
+
+    url = "https://scholar.google.com/scholar"
+    params = {
+        "q": query,
+        "hl": "en",
+        "as_sdt": "2006",  # Case law only
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        result_blocks = soup.select(".gs_ri")
+        if not result_blocks:
+            return None
+
+        our_reporter_norm = _normalize_reporter(citation.reporter)
+        best_suggestion = None
+        best_distance = 999
+
+        for block in result_blocks[:5]:
+            # Check the green line for citations
+            green_line = block.select_one(".gs_a")
+            if not green_line:
+                continue
+            green_text = green_line.get_text(strip=True)
+
+            for m in CITE_STRING_RE.finditer(green_text):
+                vol, rptr, page = m.group(1), m.group(2), m.group(3)
+                if _normalize_reporter(rptr) != our_reporter_norm:
+                    continue
+                vol_dist = _edit_distance(citation.volume, vol)
+                page_dist = _edit_distance(citation.page, page)
+                total_dist = vol_dist + page_dist
+                if 0 < total_dist <= 3 and total_dist < best_distance:
+                    best_distance = total_dist
+                    best_suggestion = f"{vol} {rptr} {page}"
+
+        return best_suggestion
+    except Exception:
+        return None
+
+
 def _suggest_correction(
     citation: Citation, session: requests.Session
 ) -> str | None:
@@ -546,7 +614,13 @@ def _suggest_correction(
                 best_distance = total_dist
                 best_suggestion = f"{vol} {rptr} {page}"
 
-    return best_suggestion
+    if best_suggestion:
+        return best_suggestion
+
+    # --- Fallback: search Google Scholar by case name ---
+    # If CourtListener doesn't have the case, Scholar might.
+    scholar_suggestion = _suggest_correction_google_scholar(citation)
+    return scholar_suggestion
 
 
 def verify_citation(citation: Citation, session: requests.Session) -> Citation:
@@ -640,7 +714,53 @@ def verify_citation(citation: Citation, session: requests.Session) -> Citation:
                 citation.status = "verified"
                 citation.detail = "Citation found (no case name to cross-check)"
 
-    # --- Step 3: Google Scholar fallback for not-found citations ---
+    # --- Step 3: CourtListener search endpoint fallback ---
+    # The citation-lookup and search endpoints use different matching
+    # logic.  A citation that fails the lookup may still be findable
+    # via the full-text search endpoint.
+    if citation.status == "not_found":
+        time.sleep(REQUEST_DELAY)
+        cite_str = f"{citation.volume} {citation.reporter} {citation.page}"
+        try:
+            search_resp = session.get(
+                SEARCH_URL,
+                params={"q": f'"{cite_str}"', "type": "o"},
+                timeout=30,
+            )
+            if search_resp.status_code == 200:
+                search_data = search_resp.json()
+                search_results = search_data.get("results", [])
+                our_cite_norm = _normalize_reporter(citation.reporter)
+                for sr in search_results[:10]:
+                    for sc in sr.get("citation", []):
+                        m = CITE_STRING_RE.search(sc)
+                        if not m:
+                            continue
+                        vol, rptr, page = m.group(1), m.group(2), m.group(3)
+                        if (vol == citation.volume
+                                and _normalize_reporter(rptr) == our_cite_norm
+                                and page == citation.page):
+                            case_name = sr.get("caseName", "") or ""
+                            citation.matched_case_name = case_name
+                            if case_name and citation.parties and not _names_match(citation.parties, case_name):
+                                citation.status = "mismatch"
+                                citation.detail = (
+                                    f"Found via CourtListener search. "
+                                    f"Name differs: \"{case_name}\""
+                                )
+                            else:
+                                citation.status = "verified"
+                                citation.detail = (
+                                    f"Found via CourtListener search: "
+                                    f"\"{case_name}\""
+                                )
+                            break
+                    if citation.status != "not_found":
+                        break
+        except Exception:
+            pass  # Search fallback is best-effort
+
+    # --- Step 4: Google Scholar fallback for not-found citations ---
     # CourtListener's database is not 100% complete, so double-check
     # against Google Scholar before declaring a citation not found.
     if citation.status == "not_found":
@@ -661,14 +781,32 @@ def verify_citation(citation: Citation, session: requests.Session) -> Citation:
                     f"\"{scholar_case_name}\""
                 )
 
-    # --- Step 4: "Did you mean?" suggestion for not-found citations ---
+    # --- Step 5: OpenLaws API fallback (if token configured) ---
+    if citation.status == "not_found":
+        openlaws_name = _verify_citation_openlaws(citation)
+        if openlaws_name:
+            citation.matched_case_name = openlaws_name
+            if citation.parties and not _names_match(citation.parties, openlaws_name):
+                citation.status = "mismatch"
+                citation.detail = (
+                    f"Not in CourtListener or Google Scholar, but found on OpenLaws. "
+                    f"Name differs: \"{openlaws_name}\""
+                )
+            else:
+                citation.status = "verified"
+                citation.detail = (
+                    f"Not in CourtListener or Google Scholar, but verified via OpenLaws: "
+                    f"\"{openlaws_name}\""
+                )
+
+    # --- Step 6: "Did you mean?" suggestion for not-found citations ---
     if citation.status == "not_found":
         suggestion = _suggest_correction(citation, session)
         if suggestion:
             citation.suggestion = suggestion
             citation.detail += f' Did you mean: {suggestion}?'
 
-    # --- Step 5: For mismatches, search by the DB case name to find its
+    # --- Step 7: For mismatches, search by the DB case name to find its
     #     correct citation and check if it's similar to what was given ---
     if citation.status == "mismatch" and citation.matched_case_name:
         suggestion = _suggest_correction(citation, session)
@@ -1898,7 +2036,7 @@ def extract_quotes(text: str, citations: list) -> list:
     """Extract substantial quoted passages attributed to case citations.
 
     Finds quoted text ≥ 40 characters and links each to a citation that
-    appears within ~300 chars after the quote (or an Id./Ibid. reference).
+    appears within ~20 chars after the quote (or an Id./Ibid. reference).
     Quotes that are NOT directly followed by a case citation are excluded —
     they are likely from transcripts, statutes, or other non-case-law
     sources that would not appear in case law databases.
@@ -1929,8 +2067,8 @@ def extract_quotes(text: str, citations: list) -> list:
         quote_end = m.end()
         quote_start = m.start()
 
-        # Look for a citation within ~300 chars after the closing quote
-        after_text = text[quote_end:quote_end + 300]
+        # Look for a citation within ~20 chars after the closing quote
+        after_text = text[quote_end:quote_end + 20]
         attributed_index = None
 
         # Check for Id. / Ibid. reference first
@@ -1940,7 +2078,7 @@ def extract_quotes(text: str, citations: list) -> list:
         else:
             # Look for nearest citation after the quote
             for pos, idx in cite_positions:
-                if pos >= quote_end and pos <= quote_end + 300:
+                if pos >= quote_end and pos <= quote_end + 20:
                     attributed_index = idx
                     last_cite_index = idx
                     break
@@ -2177,6 +2315,86 @@ def _search_google_scholar(phrase: str) -> str | None:
         if cite_str:
             return f"{case_name}, {cite_str}"
         return case_name
+    except Exception:
+        return None
+
+    return None
+
+
+def _verify_citation_openlaws(citation: Citation) -> str | None:
+    """Fallback: verify a citation via OpenLaws API.
+
+    Requires OPENLAWS_TOKEN environment variable to be set.
+    Searches OpenLaws case law for the citation string.
+    Returns the case name if found, or None.
+    """
+    token = os.environ.get("OPENLAWS_TOKEN", "")
+    if not token:
+        return None  # OpenLaws not configured — skip silently
+
+    cite_str = f"{citation.volume} {citation.reporter} {citation.page}"
+
+    # OpenLaws API: search opinions by citation string
+    url = "https://api.openlaws.us/v1/opinions"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    params = {
+        "cite": cite_str,
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            # Try keyword search as alternative endpoint
+            params = {"q": f'"{cite_str}"', "type": "caselaw"}
+            resp = requests.get(
+                "https://api.openlaws.us/v1/search",
+                params=params, headers=headers, timeout=15,
+            )
+            if resp.status_code != 200:
+                return None
+
+        data = resp.json()
+
+        # Handle both list and dict response formats
+        results = data if isinstance(data, list) else data.get("results", data.get("items", []))
+        if not results:
+            return None
+
+        # Check if any result matches our citation
+        our_cite_norm = _normalize_reporter(citation.reporter)
+        for result in results[:10]:
+            # Try various field names that OpenLaws might use
+            case_name = (
+                result.get("caseName", "")
+                or result.get("case_name", "")
+                or result.get("name", "")
+                or result.get("title", "")
+            )
+            # Check citation fields
+            cite_fields = (
+                result.get("citation", [])
+                or result.get("citations", [])
+            )
+            if isinstance(cite_fields, str):
+                cite_fields = [cite_fields]
+
+            for cf in cite_fields:
+                m = CITE_STRING_RE.search(cf if isinstance(cf, str) else str(cf))
+                if not m:
+                    continue
+                vol, rptr, page = m.group(1), m.group(2), m.group(3)
+                if (vol == citation.volume
+                        and _normalize_reporter(rptr) == our_cite_norm
+                        and page == citation.page):
+                    return case_name if case_name else "Unknown case (via OpenLaws)"
+
+            # If no citation array, check if the result itself confirms the match
+            if case_name and not cite_fields:
+                return case_name
+
     except Exception:
         return None
 
