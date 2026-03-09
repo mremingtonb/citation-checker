@@ -1862,6 +1862,504 @@ def _detect_unnecessary_hyphens(text: str) -> dict:
     return {"points": pts, "max": 5, "detail": detail}
 
 
+# ---------------------------------------------------------------------------
+# Criteria 14–28: Additional AI detection heuristics
+# ---------------------------------------------------------------------------
+
+def _detect_missing_pincites(citations: list) -> dict:
+    """Criterion 14: No Pinpoint Cites (max 5 pts).
+
+    Briefs written by real attorneys almost always include pin cites (specific
+    page numbers within an opinion).  AI-generated briefs tend to omit them.
+    """
+    if not citations or len(citations) < 4:
+        return {"points": 0, "max": 5, "detail": "Too few citations to evaluate pin cites"}
+
+    with_pin = sum(1 for c in citations if c.pin_cite.strip())
+    pct = with_pin / len(citations)
+
+    if pct > 0.50:
+        pts, detail = 0, f"{with_pin}/{len(citations)} citations include pin cites"
+    elif pct > 0.30:
+        pts, detail = 2, f"Only {with_pin}/{len(citations)} citations include pin cites"
+    elif pct > 0.10:
+        pts, detail = 3, f"Only {with_pin}/{len(citations)} citations include pin cites"
+    else:
+        pts, detail = 5, f"Almost no pin cites ({with_pin}/{len(citations)})"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+def _detect_string_cites_no_parentheticals(text: str) -> dict:
+    """Criterion 15: String Cites Without Parentheticals (max 5 pts).
+
+    Real attorneys add parenthetical explanations to string cites.
+    AI tends to produce bare string cites with no parentheticals.
+    """
+    # Find citation clusters joined by semicolons
+    # Pattern: (Court Year); Volume Reporter Page
+    string_cite_re = re.compile(
+        r"\(\s*[A-Za-z0-9.\s]*\d{4}\s*\)\s*;",
+    )
+    matches = list(string_cite_re.finditer(text))
+    bare_count = 0
+    for m in matches:
+        # Check if there's a parenthetical between the (Court Year) and the ;
+        # Look backwards from the ; for a parenthetical like (holding that...) or (explaining...)
+        before_semi = text[max(0, m.start() - 200):m.start() + len(m.group())]
+        if not re.search(r'\([a-z]+ing\s', before_semi):
+            bare_count += 1
+
+    if bare_count <= 1:
+        pts, detail = 0, f"{bare_count} string cite(s) without parentheticals"
+    elif bare_count <= 4:
+        pts, detail = 2, f"{bare_count} string cites without parenthetical explanations"
+    elif bare_count <= 7:
+        pts, detail = 3, f"{bare_count} string cites without parenthetical explanations"
+    else:
+        pts, detail = 5, f"{bare_count} string cites without parenthetical explanations"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+def _detect_citation_era_clustering(citations: list) -> dict:
+    """Criterion 16: All Citations From Same Era (max 5 pts).
+
+    AI tends to cluster citations within a narrow year range. Real briefs
+    typically cite cases spanning decades.
+    """
+    if not citations or len(citations) < 5:
+        return {"points": 0, "max": 5, "detail": "Too few citations to evaluate era clustering"}
+
+    years = []
+    for c in citations:
+        try:
+            years.append(int(c.year))
+        except (ValueError, TypeError):
+            pass
+
+    if len(years) < 5:
+        return {"points": 0, "max": 5, "detail": "Too few citations with valid years"}
+
+    year_range = max(years) - min(years)
+    if year_range > 15:
+        pts, detail = 0, f"Citation years span {year_range} years ({min(years)}-{max(years)})"
+    elif year_range > 10:
+        pts, detail = 2, f"Citations clustered within {year_range} years ({min(years)}-{max(years)})"
+    elif year_range > 5:
+        pts, detail = 3, f"Citations clustered within {year_range} years ({min(years)}-{max(years)})"
+    else:
+        pts, detail = 5, f"All citations within {year_range} years ({min(years)}-{max(years)}) — suspicious clustering"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+def _detect_missing_footnotes(text: str) -> dict:
+    """Criterion 17: No Footnotes or Endnotes (max 3 pts).
+
+    Substantial legal briefs typically use footnotes. AI-generated text
+    almost never includes them.
+    """
+    word_count = len(text.split())
+    if word_count < 2000:
+        return {"points": 0, "max": 3, "detail": "Brief too short to expect footnotes"}
+
+    # Check for footnote markers
+    has_footnotes = bool(
+        re.search(r'\[(\d{1,3})\]', text)                    # [1], [2]
+        or re.search(r'\bFN\s?\d', text, re.IGNORECASE)      # FN1, FN 2
+        or re.search(r'\bfootnote\b', text, re.IGNORECASE)    # word "footnote"
+        or re.search(r'\bendnote\b', text, re.IGNORECASE)     # word "endnote"
+        or re.search(r'\bsupra\s+note\s+\d', text, re.IGNORECASE)   # supra note 1
+        or re.search(r'\bsee\s+note\s+\d', text, re.IGNORECASE)     # see note 1
+    )
+
+    if has_footnotes:
+        return {"points": 0, "max": 3, "detail": "Footnotes or endnotes detected"}
+    else:
+        return {"points": 3, "max": 3, "detail": f"No footnotes detected in {word_count}-word brief"}
+
+
+def _detect_missing_toa_toc(text: str) -> dict:
+    """Criterion 18: Missing Table of Authorities / Contents (max 3 pts).
+
+    Longer briefs should include a Table of Authorities or Table of Contents.
+    """
+    word_count = len(text.split())
+    if word_count < 3000:
+        return {"points": 0, "max": 3, "detail": "Brief too short to expect TOA/TOC"}
+
+    upper_text = text.upper()
+    has_toa = (
+        "TABLE OF AUTHORITIES" in upper_text
+        or "TABLE OF CONTENTS" in upper_text
+        or "TABLE OF CASES" in upper_text
+        or "TABLE OF CITATIONS" in upper_text
+    )
+
+    if has_toa:
+        return {"points": 0, "max": 3, "detail": "Table of Authorities/Contents found"}
+    else:
+        return {"points": 3, "max": 3, "detail": f"No Table of Authorities or Contents in {word_count}-word brief"}
+
+
+def _detect_neutral_tone(text: str) -> dict:
+    """Criterion 19: Overly Balanced/Neutral Tone (max 5 pts).
+
+    Legal briefs should advocate. AI often produces balanced, neutral text
+    that considers both sides — unlike real advocacy writing.
+    """
+    text_lower = text.lower()
+
+    neutral_phrases = [
+        "on the other hand", "while it is true that", "admittedly",
+        "the opposing view", "both sides", "to be fair",
+        "one could argue the opposite", "there are merits to both",
+        "it is important to consider", "it must be acknowledged",
+        "the other side contends", "balancing the interests",
+        "weighing the arguments", "in fairness",
+    ]
+
+    advocacy_phrases = [
+        "clearly", "the court must", "there is no question",
+        "undeniably", "the evidence conclusively", "it is beyond dispute",
+        "without a doubt", "manifestly", "cannot be disputed",
+        "the record demonstrates", "the state submits",
+        "appellant respectfully submits", "petitioner contends",
+    ]
+
+    neutral_count = sum(text_lower.count(p) for p in neutral_phrases)
+    advocacy_count = sum(text_lower.count(p) for p in advocacy_phrases)
+
+    if advocacy_count == 0 and neutral_count == 0:
+        return {"points": 0, "max": 5, "detail": "No strong tone indicators detected"}
+
+    if advocacy_count == 0:
+        ratio = neutral_count  # treat as high
+    else:
+        ratio = neutral_count / advocacy_count
+
+    if ratio <= 0.3:
+        pts, detail = 0, f"Strong advocacy tone ({advocacy_count} advocacy vs {neutral_count} neutral phrases)"
+    elif ratio <= 1.0:
+        pts, detail = 2, f"Somewhat neutral tone ({advocacy_count} advocacy vs {neutral_count} neutral phrases)"
+    elif ratio <= 2.0:
+        pts, detail = 3, f"Overly balanced tone ({advocacy_count} advocacy vs {neutral_count} neutral phrases)"
+    else:
+        pts, detail = 5, f"Very neutral/balanced tone ({advocacy_count} advocacy vs {neutral_count} neutral phrases)"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+def _detect_generic_facts(text: str) -> dict:
+    """Criterion 20: Generic Statement of Facts (max 4 pts).
+
+    AI-generated fact sections lack specific details like dates, names,
+    dollar amounts, and record references.
+    """
+    # Find the "Statement of Facts" section
+    facts_match = re.search(
+        r'(?:STATEMENT\s+OF\s+(?:THE\s+)?FACTS|FACTUAL\s+BACKGROUND|'
+        r'STATEMENT\s+OF\s+(?:THE\s+)?CASE)',
+        text, re.IGNORECASE,
+    )
+    if not facts_match:
+        return {"points": 0, "max": 4, "detail": "No Statement of Facts section identified"}
+
+    # Grab text from the heading to the next major heading or 3000 chars
+    start = facts_match.end()
+    next_heading = re.search(
+        r'\n\s*(?:[A-Z]{2,}(?:\s+[A-Z]{2,})+|(?:ARGUMENT|POINT|CONCLUSION|SUMMARY|LEGAL))',
+        text[start:start + 5000],
+    )
+    end = start + (next_heading.start() if next_heading else 3000)
+    facts_text = text[start:end]
+
+    if len(facts_text.split()) < 50:
+        return {"points": 0, "max": 4, "detail": "Statement of Facts too short to evaluate"}
+
+    specificity_count = 0
+    # Dates
+    specificity_count += len(re.findall(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b', facts_text))
+    specificity_count += len(re.findall(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}', facts_text))
+    # Dollar amounts
+    specificity_count += len(re.findall(r'\$[\d,]+(?:\.\d{2})?', facts_text))
+    # Record references
+    specificity_count += len(re.findall(r'\b(?:R\.\s*\d|at\s+\d+|p\.\s*\d|App\.\s*\d|Ex\.\s*\d|Exhibit\s+\w)', facts_text, re.IGNORECASE))
+    # Specific addresses or numbered locations
+    specificity_count += len(re.findall(r'\d{2,5}\s+[A-Z][a-z]+\s+(?:Street|Avenue|Road|Drive|Boulevard|Lane|Court|Place)', facts_text))
+
+    per_100_words = specificity_count / (len(facts_text.split()) / 100)
+
+    if per_100_words >= 3:
+        pts, detail = 0, f"Statement of Facts contains specific details ({specificity_count} specific references)"
+    elif per_100_words >= 1:
+        pts, detail = 2, f"Statement of Facts has moderate specificity ({specificity_count} references)"
+    else:
+        pts, detail = 4, f"Statement of Facts lacks specific details ({specificity_count} references found)"
+
+    return {"points": pts, "max": 4, "detail": detail}
+
+
+def _detect_hedging_language(text: str) -> dict:
+    """Criterion 21: Excessive Hedging Language (max 5 pts).
+
+    AI-generated text hedges excessively with tentative phrases that
+    real attorneys avoid in advocacy briefs.
+    """
+    text_lower = text.lower()
+    hedging_phrases = [
+        "it could be argued", "one might contend", "it is possible that",
+        "it is conceivable", "there is an argument to be made",
+        "it may be the case", "it remains to be seen",
+        "reasonable minds may differ", "one could argue",
+        "it would seem", "it is plausible", "perhaps the court",
+        "it might be suggested", "one might reasonably conclude",
+        "there is some basis for", "it is not entirely clear",
+    ]
+
+    count = sum(text_lower.count(p) for p in hedging_phrases)
+
+    if count == 0:
+        pts, detail = 0, "No excessive hedging language detected"
+    elif count <= 2:
+        pts, detail = 2, f"{count} hedging phrase(s) detected"
+    elif count <= 5:
+        pts, detail = 3, f"{count} hedging phrases detected"
+    else:
+        pts, detail = 5, f"{count} hedging phrases detected — unusually tentative tone"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+def _detect_numbered_lists(text: str) -> dict:
+    """Criterion 22: Numbered Lists in Argument Sections (max 4 pts).
+
+    AI frequently structures arguments as numbered lists, which is uncommon
+    in real legal briefs.
+    """
+    # Count lines starting with numbered patterns
+    numbered_patterns = re.findall(
+        r'(?:^|\n)\s*(?:\(\d+\)|\d+\.\s+|(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth),)',
+        text,
+    )
+    count = len(numbered_patterns)
+
+    if count <= 1:
+        pts, detail = 0, f"{count} numbered list pattern(s) found"
+    elif count <= 3:
+        pts, detail = 2, f"{count} numbered list patterns found"
+    else:
+        pts, detail = 4, f"{count} numbered list patterns — AI-style enumeration"
+
+    return {"points": pts, "max": 4, "detail": detail}
+
+
+def _detect_nonstandard_headings(text: str) -> dict:
+    """Criterion 23: Non-Standard Section Headings (max 3 pts).
+
+    AI uses academic-style headings like "Legal Analysis" or "Discussion"
+    instead of standard legal brief headings.
+    """
+    ai_headings = [
+        r'\bLEGAL\s+ANALYSIS\b', r'\bDISCUSSION\b', r'\bANALYSIS\b',
+        r'\bLEGAL\s+FRAMEWORK\b', r'\bRELEVANT\s+LAW\b',
+        r'\bAPPLICATION\s+OF\s+LAW\b', r'\bCONCLUSION\s+OF\s+LAW\b',
+        r'\bLEGAL\s+STANDARD\b', r'\bAPPLICABLE\s+LAW\b',
+    ]
+    upper_text = text.upper()
+    found = sum(1 for pat in ai_headings if re.search(pat, upper_text))
+
+    if found == 0:
+        pts, detail = 0, "No non-standard headings detected"
+    elif found <= 2:
+        pts, detail = 2, f"{found} non-standard heading(s) (e.g., 'Legal Analysis', 'Discussion')"
+    else:
+        pts, detail = 3, f"{found} non-standard headings — AI-style section labels"
+
+    return {"points": pts, "max": 3, "detail": detail}
+
+
+def _detect_court_overuse(text: str) -> dict:
+    """Criterion 24: Overuse of 'the Court' (max 3 pts).
+
+    AI text overuses 'the Court' and 'this Court'. Normal frequency is
+    ~2-5 per 1000 words; AI often hits 8+.
+    """
+    word_count = len(text.split())
+    if word_count < 500:
+        return {"points": 0, "max": 3, "detail": "Brief too short to evaluate"}
+
+    count = len(re.findall(r'\b(?:the|this)\s+[Cc]ourt\b', text))
+    per_1k = count / (word_count / 1000)
+
+    if per_1k < 6:
+        pts, detail = 0, f"'the/this Court' usage: {per_1k:.1f} per 1000 words (normal)"
+    elif per_1k < 8:
+        pts, detail = 1, f"'the/this Court' usage: {per_1k:.1f} per 1000 words (slightly elevated)"
+    elif per_1k < 12:
+        pts, detail = 2, f"'the/this Court' usage: {per_1k:.1f} per 1000 words (elevated)"
+    else:
+        pts, detail = 3, f"'the/this Court' usage: {per_1k:.1f} per 1000 words (excessive)"
+
+    return {"points": pts, "max": 3, "detail": detail}
+
+
+def _detect_markdown_artifacts(text: str) -> dict:
+    """Criterion 25: Markdown-Style Artifacts (max 5 pts). AUTO-FLAG at 5 pts.
+
+    Markdown formatting in a legal brief is an extremely strong AI indicator.
+    """
+    patterns = [
+        (r'\*\*[^*]+\*\*', '**bold**'),       # **bold**
+        (r'(?<!\*)\*[^*\s][^*]*[^*\s]\*(?!\*)', '*italic*'),  # *italic*
+        (r'^#{1,3}\s+\w', '# heading'),        # # heading
+        (r'\[([^\]]+)\]\([^)]+\)', '[link](url)'),  # [link](url)
+        (r'```', 'triple backticks'),           # code blocks
+        (r'^>\s+\w', '> blockquote'),           # > blockquote
+    ]
+
+    found_types = []
+    total = 0
+    for pat, label in patterns:
+        matches = re.findall(pat, text, re.MULTILINE)
+        if matches:
+            total += len(matches)
+            found_types.append(label)
+
+    if total == 0:
+        return {"points": 0, "max": 5, "detail": "No markdown artifacts detected"}
+    elif total <= 2:
+        return {"points": 3, "max": 5, "detail": f"Markdown artifacts found: {', '.join(found_types)}"}
+    else:
+        return {
+            "points": 5, "max": 5,
+            "detail": f"{total} markdown artifacts found ({', '.join(found_types)}) — strong AI indicator",
+            "auto_flag": True,
+        }
+
+
+def _detect_citation_density_anomalies(text: str, citations: list) -> dict:
+    """Criterion 26: Citation Density Anomalies (max 4 pts).
+
+    AI text often has uneven citation distribution — large argument blocks
+    with no citations, or citation dumps with no analysis.
+    """
+    if not citations:
+        return {"points": 0, "max": 4, "detail": "No citations to evaluate density"}
+
+    words = text.split()
+    if len(words) < 1000:
+        return {"points": 0, "max": 4, "detail": "Brief too short to evaluate citation density"}
+
+    # Split into ~500-word chunks
+    chunk_size = 500
+    chunks = [' '.join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+    if len(chunks) < 3:
+        return {"points": 0, "max": 4, "detail": "Brief too short to evaluate citation density"}
+
+    # Build a simple cite pattern from the reporter list
+    cite_pat = re.compile(r'\d{1,4}\s+(?:' + REPORTER_PATTERN + r')\s+\d{1,5}')
+
+    sparse_chunks = 0
+    for chunk in chunks:
+        has_argument = bool(re.search(
+            r'\b(?:held|established|recognized|concluded|determined|ruled|found)\b',
+            chunk, re.IGNORECASE,
+        ))
+        cite_count = len(cite_pat.findall(chunk))
+        if has_argument and cite_count == 0:
+            sparse_chunks += 1
+
+    if sparse_chunks == 0:
+        pts, detail = 0, "Citation density is even across the brief"
+    elif sparse_chunks <= 2:
+        pts, detail = 2, f"{sparse_chunks} argument section(s) with no supporting citations"
+    else:
+        pts, detail = 4, f"{sparse_chunks} argument sections with no supporting citations"
+
+    return {"points": pts, "max": 4, "detail": detail}
+
+
+def _detect_phantom_opinions(text: str, citations: list) -> dict:
+    """Criterion 27: Phantom Concurrences/Dissents (max 5 pts).
+
+    AI frequently fabricates references to concurring or dissenting opinions.
+    Real briefs rarely cite concurrences/dissents unless they are central.
+    """
+    # Count references to concurrences/dissents
+    opinion_refs = re.findall(
+        r'\b(?:concurring|dissenting|concurrence|dissent|concurred|dissented)\b',
+        text, re.IGNORECASE,
+    )
+    ref_count = len(opinion_refs)
+
+    total_cites = len(citations) if citations else 0
+
+    if ref_count <= 1:
+        pts, detail = 0, f"{ref_count} reference(s) to concurrences/dissents"
+    elif ref_count <= 3:
+        if total_cites > 0 and ref_count / total_cites > 0.3:
+            pts = 3
+            detail = f"{ref_count} concurrence/dissent references relative to {total_cites} total citations — suspicious"
+        else:
+            pts = 1
+            detail = f"{ref_count} concurrence/dissent references"
+    else:
+        pts, detail = 5, f"{ref_count} concurrence/dissent references — AI tends to fabricate these"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
+def _detect_overruled_citations(citations: list, session=None) -> dict:
+    """Criterion 28: Citing Overruled/Superseded Cases (max 5 pts).
+
+    Checks verified citations against CourtListener for negative treatment.
+    """
+    if not citations or session is None:
+        return {"points": 0, "max": 5, "detail": "Unable to check for overruled cases"}
+
+    overruled = []
+    token = os.environ.get("COURTLISTENER_TOKEN", "")
+    headers = {"Authorization": f"Token {token}"} if token else {}
+
+    for c in citations:
+        if c.status not in ("verified", "mismatch"):
+            continue
+        # Search CourtListener for negative treatment
+        try:
+            resp = session.get(
+                SEARCH_URL,
+                params={
+                    "q": f"{c.volume} {c.reporter} {c.page}",
+                    "type": "o",
+                },
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", [])
+                for result in results[:3]:
+                    snippet = (result.get("snippet", "") + " " + result.get("text", "")).lower()
+                    if any(kw in snippet for kw in ["overruled", "superseded", "abrogated", "overruling"]):
+                        overruled.append(f"{c.volume} {c.reporter} {c.page}")
+                        break
+        except Exception:
+            pass
+        time.sleep(0.5)  # rate limiting
+
+    count = len(overruled)
+    if count == 0:
+        pts, detail = 0, "No overruled or superseded cases detected"
+    elif count == 1:
+        pts, detail = 3, f"1 potentially overruled citation: {overruled[0]}"
+    else:
+        pts, detail = 5, f"{count} potentially overruled citations: {'; '.join(overruled[:3])}"
+
+    return {"points": pts, "max": 5, "detail": detail}
+
+
 # --- Main scoring function ---
 
 def compute_ai_score(
@@ -1870,6 +2368,7 @@ def compute_ai_score(
     pro_se_override: bool = False,
     allow_other_state: bool = False,
     allow_federal: bool = False,
+    session=None,
 ) -> dict:
     """
     Compute the AI-generation probability score on a 100-point scale.
@@ -2022,6 +2521,129 @@ def compute_ai_score(
         "name": "Excessive Unnecessary Hyphenation",
         "description": "Words joined with hyphens where grammar doesn\u2019t require them (e.g., \u201cclearly-established\u201d instead of \u201cclearly established\u201d)",
         "points": c13["points"], "max": c13["max"], "detail": c13["detail"],
+    })
+
+    # Criterion 14: Missing pin cites
+    c14 = _detect_missing_pincites(citations or [])
+    criteria.append({
+        "name": "No Pinpoint Cites",
+        "description": "Citations lack specific page references within the opinion",
+        "points": c14["points"], "max": c14["max"], "detail": c14["detail"],
+    })
+
+    # Criterion 15: String cites without parentheticals
+    c15 = _detect_string_cites_no_parentheticals(text)
+    criteria.append({
+        "name": "String Cites Without Parentheticals",
+        "description": "Multiple citations strung together without explanatory parentheticals",
+        "points": c15["points"], "max": c15["max"], "detail": c15["detail"],
+    })
+
+    # Criterion 16: Citation era clustering
+    c16 = _detect_citation_era_clustering(citations or [])
+    criteria.append({
+        "name": "All Citations From Same Era",
+        "description": "Citations clustered within a narrow year range instead of spanning decades",
+        "points": c16["points"], "max": c16["max"], "detail": c16["detail"],
+    })
+
+    # Criterion 17: Missing footnotes
+    c17 = _detect_missing_footnotes(text)
+    criteria.append({
+        "name": "No Footnotes or Endnotes",
+        "description": "Substantial brief lacks footnotes, which AI-generated text almost never includes",
+        "points": c17["points"], "max": c17["max"], "detail": c17["detail"],
+    })
+
+    # Criterion 18: Missing Table of Authorities / Contents
+    c18 = _detect_missing_toa_toc(text)
+    criteria.append({
+        "name": "Missing Table of Authorities/Contents",
+        "description": "Longer brief lacks a Table of Authorities or Table of Contents",
+        "points": c18["points"], "max": c18["max"], "detail": c18["detail"],
+    })
+
+    # Criterion 19: Neutral tone
+    c19 = _detect_neutral_tone(text)
+    criteria.append({
+        "name": "Overly Balanced/Neutral Tone",
+        "description": "Brief reads as balanced analysis rather than advocacy",
+        "points": c19["points"], "max": c19["max"], "detail": c19["detail"],
+    })
+
+    # Criterion 20: Generic statement of facts
+    c20 = _detect_generic_facts(text)
+    criteria.append({
+        "name": "Generic Statement of Facts",
+        "description": "Fact section lacks specific dates, names, amounts, and record references",
+        "points": c20["points"], "max": c20["max"], "detail": c20["detail"],
+    })
+
+    # Criterion 21: Hedging language
+    c21 = _detect_hedging_language(text)
+    criteria.append({
+        "name": "Excessive Hedging Language",
+        "description": "Tentative phrases like \u201cit could be argued\u201d or \u201cone might contend\u201d",
+        "points": c21["points"], "max": c21["max"], "detail": c21["detail"],
+    })
+
+    # Criterion 22: Numbered lists
+    c22 = _detect_numbered_lists(text)
+    criteria.append({
+        "name": "Numbered Lists in Arguments",
+        "description": "AI-style enumerated arguments (First... Second... Third...)",
+        "points": c22["points"], "max": c22["max"], "detail": c22["detail"],
+    })
+
+    # Criterion 23: Non-standard headings
+    c23 = _detect_nonstandard_headings(text)
+    criteria.append({
+        "name": "Non-Standard Section Headings",
+        "description": "Academic-style headings like \u201cLegal Analysis\u201d instead of standard \u201cARGUMENT\u201d",
+        "points": c23["points"], "max": c23["max"], "detail": c23["detail"],
+    })
+
+    # Criterion 24: Court overuse
+    c24 = _detect_court_overuse(text)
+    criteria.append({
+        "name": "Overuse of \u201cthe Court\u201d",
+        "description": "Excessive repetition of \u201cthe Court\u201d / \u201cthis Court\u201d (AI often hits 8+ per 1000 words)",
+        "points": c24["points"], "max": c24["max"], "detail": c24["detail"],
+    })
+
+    # Criterion 25: Markdown artifacts — AUTO FLAG at 5 pts
+    c25 = _detect_markdown_artifacts(text)
+    if c25.get("auto_flag"):
+        auto_flagged = True
+    criteria.append({
+        "name": "Markdown-Style Artifacts",
+        "description": "Markdown formatting (**bold**, *italic*, # headings) in a legal document",
+        "points": c25["points"], "max": c25["max"], "detail": c25["detail"],
+        "auto_flag": c25.get("auto_flag", False),
+    })
+
+    # Criterion 26: Citation density anomalies
+    c26 = _detect_citation_density_anomalies(text, citations or [])
+    criteria.append({
+        "name": "Citation Density Anomalies",
+        "description": "Argument sections with dense legal claims but no supporting citations",
+        "points": c26["points"], "max": c26["max"], "detail": c26["detail"],
+    })
+
+    # Criterion 27: Phantom concurrences/dissents
+    c27 = _detect_phantom_opinions(text, citations or [])
+    criteria.append({
+        "name": "Phantom Concurrences/Dissents",
+        "description": "Excessive references to concurrences/dissents, which AI tends to fabricate",
+        "points": c27["points"], "max": c27["max"], "detail": c27["detail"],
+    })
+
+    # Criterion 28: Overruled/superseded cases
+    c28 = _detect_overruled_citations(citations or [], session=session)
+    criteria.append({
+        "name": "Citing Overruled/Superseded Cases",
+        "description": "Citations to cases that have been overruled, superseded, or abrogated",
+        "points": c28["points"], "max": c28["max"], "detail": c28["detail"],
     })
 
     # Sum and label

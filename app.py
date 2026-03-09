@@ -613,6 +613,60 @@ HTML_PAGE = """<!DOCTYPE html>
     text-decoration: underline;
   }
 
+  .changelog-section {
+    margin-top: 1.5rem;
+    border: 1px solid #dfe6e9;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .changelog-header {
+    background: #f8f9fa;
+    padding: 0.75rem 1rem;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #2d3436;
+    user-select: none;
+  }
+  .changelog-header:hover { background: #eef1f3; }
+  .changelog-toggle { transition: transform 0.2s; }
+  .changelog-toggle.open { transform: rotate(180deg); }
+  .changelog-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+  }
+  .changelog-body.open {
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  .changelog-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .changelog-list li {
+    padding: 0.5rem 1rem;
+    border-top: 1px solid #f0f0f0;
+    font-size: 0.82rem;
+    color: #555;
+  }
+  .changelog-list li:hover { background: #fafbfc; }
+  .changelog-date {
+    color: #636e72;
+    font-family: monospace;
+    margin-right: 0.5rem;
+  }
+  .changelog-hash {
+    color: #0984e3;
+    font-family: monospace;
+    margin-right: 0.5rem;
+    font-size: 0.78rem;
+  }
+
   @media (max-width: 600px) {
     .container { padding: 1rem; }
     th, td { padding: 0.5rem; font-size: 0.8rem; }
@@ -750,7 +804,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <tbody id="criteriaBody"></tbody>
     </table>
     <div class="methodology-box">
-      <strong>How this score is calculated:</strong> The score is the sum of points across 13 criteria
+      <strong>How this score is calculated:</strong> The score is the sum of points across 28 criteria
       that indicate potential AI generation. Each criterion has a maximum point value based on its
       significance as an AI indicator. Higher total scores indicate greater likelihood that the brief
       was AI-generated. The presence of fabricated (non-existent) case citations automatically flags
@@ -797,6 +851,18 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="privacy-notice">
     &#128274; <strong>Privacy:</strong> Uploaded files are processed in real time and immediately deleted from the server.
     No documents, text, or citation data are stored after your analysis is complete.
+  </div>
+
+  <div class="changelog-section">
+    <div class="changelog-header" onclick="toggleChangelog()">
+      Recent Updates
+      <span class="changelog-toggle" id="changelogToggle">&#9660;</span>
+    </div>
+    <div class="changelog-body" id="changelogBody">
+      <ul class="changelog-list" id="changelogList">
+        <li style="color:#999;">Loading...</li>
+      </ul>
+    </div>
   </div>
 
   <footer class="site-footer">
@@ -1194,6 +1260,33 @@ function escHtml(str) {
   d.textContent = str || '';
   return d.innerHTML;
 }
+
+// --- Changelog ---
+function toggleChangelog() {
+  const body = document.getElementById('changelogBody');
+  const toggle = document.getElementById('changelogToggle');
+  body.classList.toggle('open');
+  toggle.classList.toggle('open');
+}
+
+fetch('/changelog')
+  .then(r => r.json())
+  .then(entries => {
+    const list = document.getElementById('changelogList');
+    if (!entries.length) {
+      list.innerHTML = '<li style="color:#999;">No recent updates available.</li>';
+      return;
+    }
+    list.innerHTML = entries.map(e =>
+      `<li><span class="changelog-date">${escHtml(e.date)}</span>` +
+      `<span class="changelog-hash">${escHtml(e.hash)}</span>` +
+      `${escHtml(e.message)}</li>`
+    ).join('');
+  })
+  .catch(() => {
+    document.getElementById('changelogList').innerHTML =
+      '<li style="color:#999;">Could not load changelog.</li>';
+  });
 </script>
 
 </body>
@@ -1321,6 +1414,7 @@ def verify(job_id):
             pro_se_override=job.get("pro_se_manual", False),
             allow_other_state=job.get("allow_other_state", False),
             allow_federal=job.get("allow_federal", False),
+            session=session,
         )
 
         # --- Phase 2: Quotation verification ---
@@ -1665,7 +1759,7 @@ def download_docx(job_id):
         meth_para = doc.add_paragraph()
         meth_run = meth_para.add_run(
             "How this score is calculated: The score is the sum of points across "
-            "13 criteria that indicate potential AI generation. Each criterion has a "
+            "28 criteria that indicate potential AI generation. Each criterion has a "
             "maximum point value based on its significance as an AI indicator. Higher "
             "total scores indicate greater likelihood that the brief was AI-generated. "
             "The presence of fabricated (non-existent) case citations automatically "
@@ -1826,6 +1920,35 @@ def download_docx(job_id):
         as_attachment=True,
         download_name="citation_report.docx",
     )
+
+
+# ---------------------------------------------------------------------------
+# Changelog route
+# ---------------------------------------------------------------------------
+
+@app.route("/changelog")
+def changelog():
+    """Return recent git commits as JSON for the change history window."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "log", "--oneline", "--format=%h|%ad|%s", "--date=short", "-30"],
+            capture_output=True, text=True, timeout=10,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        entries = []
+        for line in result.stdout.strip().split("\n"):
+            if "|" in line:
+                parts = line.split("|", 2)
+                if len(parts) == 3:
+                    entries.append({
+                        "hash": parts[0],
+                        "date": parts[1],
+                        "message": parts[2],
+                    })
+        return jsonify(entries)
+    except Exception:
+        return jsonify([])
 
 
 # ---------------------------------------------------------------------------
