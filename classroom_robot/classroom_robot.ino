@@ -1,21 +1,30 @@
 /*
  * Classroom Sound Level Robot (Decibel Version)
+ * Using 1088AS LED Matrix Module (MAX7219 driver built in)
  *
  * Shows a face on an 8x8 LED matrix that reacts to noise level:
- *   < 50 dB  -> Happy face    :)   (quiet / whisper)
- *   50-65 dB -> Neutral face  :|   (normal talking)
- *   65-80 dB -> Worried face  :(   (loud talking)
- *   > 80 dB  -> Shocked face  :O   (shouting!)
+ *   < 45 dB  -> Big grin face :D   (very quiet)
+ *   45-50 dB -> Wink face     ;)   (quiet)
+ *   50-55 dB -> Happy face    :)   (quiet talking)
+ *   55-60 dB -> Neutral face  :|   (normal talking)
+ *   60-65 dB -> Worried face  :(   (getting loud)
+ *   65-70 dB -> Shocked face  :O   (loud!)
+ *   70-76 dB -> Distressed    D:   (very loud!)
+ *   > 76 dB  -> Furious face  D:<  (way too loud!!)
  *
  * Components:
  *   - Arduino Nano
- *   - MAX7219 8x8 LED Matrix
+ *   - 1088AS 8x8 LED Matrix Module (with MAX7219)
  *   - 2x 3362 Sound Sensor Modules (the robot's "eyes")
+ *   - Touch sensor (3-pin: SIG, VCC, GND)
+ *   - Buzzer (2-pin)
  *
  * Wiring:
- *   MAX7219:  DIN -> D11, CLK -> D13, CS -> D10, VCC -> 5V, GND -> GND
+ *   Matrix:  DIN -> D11, CLK -> D13, CS -> D10, VCC -> 5V, GND -> GND
  *   Mic 1 (left eye):   AO -> A0, VCC -> 5V, GND -> GND
  *   Mic 2 (right eye):  AO -> A1, VCC -> 5V, GND -> GND
+ *   Touch sensor:  SIG -> D2, VCC -> 5V, GND -> GND
+ *   Buzzer:        + -> D3, - -> GND
  *
  * Library needed: LedControl (install via Library Manager)
  *
@@ -33,11 +42,13 @@
 #include <math.h>
 
 // --- Pin Configuration ---
-const int DIN_PIN  = 11;   // MAX7219 Data In
-const int CS_PIN   = 10;   // MAX7219 Chip Select (LOAD)
-const int CLK_PIN  = 13;   // MAX7219 Clock
-const int MIC1_PIN = A0;   // Left eye microphone  (AO pin)
-const int MIC2_PIN = A1;   // Right eye microphone (AO pin)
+const int DIN_PIN  = 11;   // Matrix Data In
+const int CS_PIN   = 10;   // Matrix Chip Select (LOAD)
+const int CLK_PIN  = 13;   // Matrix Clock
+const int MIC1_PIN  = A0;  // Left eye microphone  (AO pin)
+const int MIC2_PIN  = A1;  // Right eye microphone (AO pin)
+const int TOUCH_PIN = 2;   // Touch sensor SIG pin
+const int BUZZER_PIN = 3;  // Buzzer positive pin
 
 // --- Decibel Thresholds ---
 // Typical classroom sound levels for reference:
@@ -45,9 +56,13 @@ const int MIC2_PIN = A1;   // Right eye microphone (AO pin)
 //   ~55 dB = normal conversation
 //   ~70 dB = loud talking / multiple conversations
 //   ~85 dB = shouting across the room
-const float DB_QUIET  = 55.0;   // Below this = quiet
-const float DB_MEDIUM = 68.0;   // Below this = getting noisy
-const float DB_LOUD   = 82.0;   // Below this = loud, above = very loud
+const float DB_SILENT    = 45.0;   // Below this = very quiet (big grin)
+const float DB_WINK      = 50.0;   // Below this = quiet (wink)
+const float DB_QUIET     = 55.0;   // Below this = quiet talking (happy)
+const float DB_MEDIUM    = 60.0;   // Below this = normal talking (neutral)
+const float DB_LOUD      = 65.0;   // Below this = getting loud (worried)
+const float DB_VERY_LOUD = 70.0;   // Below this = loud (shocked)
+const float DB_EXTREME   = 76.0;   // Below this = distressed, above = furious
 
 // --- Calibration Offset ---
 // This shifts ALL dB readings up or down.
@@ -62,12 +77,15 @@ const float DB_OFFSET = 10.0;
 // Higher = faster response (more reactive but may flicker)
 const float SMOOTHING = 0.3;
 
+// --- Tickle ---
+const int TICKLE_DURATION_MS = 2000;  // How long the tickle lasts
+
 // --- Sampling ---
 const int SAMPLE_WINDOW_MS = 50;  // Milliseconds to listen per reading
 
 // --- Internal Constants ---
-const float V_REF = 0.005;              // Minimum reference voltage
-const float ADC_TO_VOLTS = 5.0 / 1024.0; // ADC units to volts
+const float V_REF = 0.005;                // Minimum reference voltage
+const float ADC_TO_VOLTS = 5.0 / 1024.0;  // ADC units to volts
 
 // --- Matrix Setup (DIN, CLK, CS, number of devices) ---
 LedControl matrix = LedControl(DIN_PIN, CLK_PIN, CS_PIN, 1);
@@ -79,7 +97,31 @@ LedControl matrix = LedControl(DIN_PIN, CLK_PIN, CS_PIN, 1);
 //   Each row is 8 pixels wide. 1 = LED on, 0 = LED off.
 // ============================================================
 
-// Happy face :)  — classroom is nice and quiet
+// Big grin face :D  — classroom is very quiet!
+const byte FACE_GRIN[8] = {
+  0b00000000,
+  0b01100110,   //  ##  ##
+  0b01100110,   //  ##  ##
+  0b00000000,
+  0b01111110,   //  ######   <- big open grin
+  0b01000010,   //  #    #
+  0b01000010,   //  #    #
+  0b00111100    //   ####
+};
+
+// Wink face ;)  — classroom is quiet
+const byte FACE_WINK[8] = {
+  0b00000000,
+  0b01100110,   //  ##  ##
+  0b00100110,   //   #  ##   <- left eye winking
+  0b00000000,
+  0b00000000,
+  0b01000010,   //  #    #
+  0b00111100,   //   ####    <- smile
+  0b00000000
+};
+
+// Happy face :)  — quiet talking
 const byte FACE_HAPPY[8] = {
   0b00000000,
   0b01100110,   //  ##  ##
@@ -127,14 +169,44 @@ const byte FACE_SHOCKED[8] = {
   0b00011000    //    ##
 };
 
+// Distressed face D:  — very loud!
+const byte FACE_DISTRESSED[8] = {
+  0b00000000,
+  0b01100110,   //  ##  ##
+  0b01100110,   //  ##  ##
+  0b00000000,
+  0b01111110,   //  ######   <- flat top of D mouth
+  0b01000010,   //  #    #
+  0b00100100,   //   #  #
+  0b00011000    //    ##     <- curved bottom
+};
+
+// Furious face D:<  — way too loud!!
+const byte FACE_FURIOUS[8] = {
+  0b01000010,   //  #    #   <- angry eyebrows
+  0b00100100,   //   #  #
+  0b01100110,   //  ##  ##   <- eyes
+  0b00000000,
+  0b01111110,   //  ######   <- flat top of D mouth
+  0b01000010,   //  #    #
+  0b00100100,   //   #  #
+  0b00011000    //    ##     <- curved bottom
+};
+
 // --- State Variables ---
-float smoothedDB = 0.0;   // Smoothed decibel reading
-int currentLevel = -1;    // Current face being displayed
+float smoothedDB = 0.0;          // Smoothed decibel reading
+int currentLevel = -1;           // Current face being displayed
+bool tickled = false;             // Is the robot being tickled?
+unsigned long tickleStart = 0;    // When the tickle started
 
 void setup() {
   Serial.begin(9600);
 
-  // Initialize the MAX7219
+  // Initialize touch sensor and buzzer
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Initialize the matrix module
   matrix.shutdown(0, false);    // Wake up the display
   matrix.setIntensity(0, 8);    // Brightness 0 (dim) to 15 (blinding)
   matrix.clearDisplay(0);
@@ -143,12 +215,31 @@ void setup() {
   Serial.println(F("Compare these readings to a phone dB meter app."));
   Serial.println(F("Adjust DB_OFFSET in the code to calibrate.\n"));
 
-  // Show the happy face on power-up
-  displayFace(FACE_HAPPY);
+  // Show the big grin on power-up
+  displayFace(FACE_GRIN);
   currentLevel = 0;
 }
 
 void loop() {
+  // --- Tickle check ---
+  if (digitalRead(TOUCH_PIN) == HIGH && !tickled) {
+    tickled = true;
+    tickleStart = millis();
+    displayFace(FACE_GRIN);
+    currentLevel = -1;  // Force redraw when tickle ends
+    Serial.println(F("\t-> TICKLED! :D hehehe"));
+    laughBuzzer();
+  }
+
+  // Stay on grin face during tickle duration
+  if (tickled) {
+    if (millis() - tickleStart < TICKLE_DURATION_MS) {
+      delay(100);
+      return;  // Skip sound level check while tickled
+    }
+    tickled = false;  // Tickle is over, resume normal behavior
+  }
+
   // Read peak-to-peak amplitude from both microphone "eyes"
   int raw1 = readPeakToPeak(MIC1_PIN);
   int raw2 = readPeakToPeak(MIC2_PIN);
@@ -175,28 +266,44 @@ void loop() {
 
   // Decide which face to show based on smoothed dB level
   int newLevel;
-  if (smoothedDB < DB_QUIET) {
+  if (smoothedDB < DB_SILENT) {
     newLevel = 0;
+    Serial.println(F("\t-> VERY QUIET :D"));
+  } else if (smoothedDB < DB_WINK) {
+    newLevel = 1;
+    Serial.println(F("\t-> QUIET ;)"));
+  } else if (smoothedDB < DB_QUIET) {
+    newLevel = 2;
     Serial.println(F("\t-> QUIET :)"));
   } else if (smoothedDB < DB_MEDIUM) {
-    newLevel = 1;
+    newLevel = 3;
     Serial.println(F("\t-> MEDIUM :|"));
   } else if (smoothedDB < DB_LOUD) {
-    newLevel = 2;
+    newLevel = 4;
     Serial.println(F("\t-> LOUD :("));
+  } else if (smoothedDB < DB_VERY_LOUD) {
+    newLevel = 5;
+    Serial.println(F("\t-> VERY LOUD :O"));
+  } else if (smoothedDB < DB_EXTREME) {
+    newLevel = 6;
+    Serial.println(F("\t-> VERY LOUD D:"));
   } else {
-    newLevel = 3;
-    Serial.println(F("\t-> TOO LOUD :O"));
+    newLevel = 7;
+    Serial.println(F("\t-> WAY TOO LOUD D:<"));
   }
 
   // Only update the display when the level changes (avoids flicker)
   if (newLevel != currentLevel) {
     currentLevel = newLevel;
     switch (currentLevel) {
-      case 0: displayFace(FACE_HAPPY);   break;
-      case 1: displayFace(FACE_NEUTRAL); break;
-      case 2: displayFace(FACE_WORRIED); break;
-      case 3: displayFace(FACE_SHOCKED); break;
+      case 0: displayFace(FACE_GRIN);       break;
+      case 1: displayFace(FACE_WINK);       break;
+      case 2: displayFace(FACE_HAPPY);      break;
+      case 3: displayFace(FACE_NEUTRAL);    break;
+      case 4: displayFace(FACE_WORRIED);    break;
+      case 5: displayFace(FACE_SHOCKED);    break;
+      case 6: displayFace(FACE_DISTRESSED); break;
+      case 7: displayFace(FACE_FURIOUS);    break;
     }
   }
 
@@ -248,6 +355,24 @@ float peakToDecibels(int peakToPeak) {
   float dB = 20.0 * log10(volts / V_REF) + DB_OFFSET;
 
   return dB;
+}
+
+/*
+ * Plays a "hehehe" laugh on the buzzer using quick
+ * alternating high notes. Sounds like a giggle!
+ */
+void laughBuzzer() {
+  // Three quick "he-he-he" bursts
+  for (int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, 800, 80);
+    delay(100);
+    tone(BUZZER_PIN, 1200, 80);
+    delay(100);
+  }
+  // Finish with a higher squeak
+  tone(BUZZER_PIN, 1600, 100);
+  delay(120);
+  noTone(BUZZER_PIN);
 }
 
 /*
